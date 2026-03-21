@@ -3,7 +3,6 @@ Flow Monitor Dashboard
 Tracks market buying (CVD) and limit order activity (depth) for FLOW/USD on Binance spot.
 """
 import streamlit as st
-import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
 import altair as alt
@@ -144,7 +143,7 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     # Price chart with regime boundary markers
     st.markdown("**Price**")
     df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
-    price_line = make_chart(df_price, "Price", color="#4fc3f7")
+    price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300)
 
     # Detect regimes and add boundary dots
     regimes = detect_regimes(candle_filtered)
@@ -153,11 +152,9 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
         boundary_prices = []
         boundary_dirs = []
         for start_idx, end_idx, direction in regimes:
-            # Mark regime start
             boundary_times.append(ts_to_datetime(candle_filtered[start_idx][0]))
             boundary_prices.append(candle_filtered[start_idx][4])
             boundary_dirs.append(direction)
-            # Mark regime end
             boundary_times.append(ts_to_datetime(candle_filtered[end_idx][0]))
             boundary_prices.append(candle_filtered[end_idx][4])
             boundary_dirs.append(direction)
@@ -165,7 +162,7 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
         df_dots = pd.DataFrame({"time": boundary_times, "Price": boundary_prices, "dir": boundary_dirs})
         dots = (
             alt.Chart(df_dots)
-            .mark_circle(size=50)
+            .mark_circle(size=60)
             .encode(
                 x="time:T",
                 y=alt.Y("Price:Q", scale=alt.Scale(zero=False)),
@@ -175,7 +172,7 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
                 tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Price:Q", format=".4f"), "dir:N"],
             )
         )
-        st.altair_chart(alt.layer(price_line, dots).properties(height=200), use_container_width=True)
+        st.altair_chart(alt.layer(price_line, dots).properties(height=300), use_container_width=True)
     else:
         st.altair_chart(price_line, use_container_width=True)
 
@@ -184,7 +181,7 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     df_cvd = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_cvd_ds], "CVD": cvd_coins_ds})
     # Color based on direction
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
-    st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color), use_container_width=True)
+    st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color, height=250), use_container_width=True)
 
     # Volume bars — aggregate into hourly buckets so bars are visible
     st.markdown("**Buy / Sell Volume ($) — hourly**")
@@ -447,13 +444,11 @@ def render_regime_analysis(candle_rows, stats_rows, hours=24):
         row += "</tr>"
         rows_html += row
 
-    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:13px">
-    <table style="width:100%;border-collapse:collapse;text-align:right">
+    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
-    </table></body></html>"""
-    n_rows = rows_html.count("<tr>")
-    components.html(html, height=50 + 36 * n_rows)
+    </table>"""
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ── Trades Section ──────────────────────────────────────────────────────────
@@ -483,14 +478,11 @@ def render_notable_trades(conn, hours=24):
             f'</tr>'
         )
 
-    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:13px">
-    <table style="width:100%;border-collapse:collapse;text-align:right">
+    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.0">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
-    </table></body></html>"""
-
-    n_rows = min(len(large_trades), 50)
-    components.html(html, height=40 + 26 * n_rows, scrolling=True)
+    </table>"""
+    st.markdown(html, unsafe_allow_html=True)
 
     # Summary stats
     buy_large = [r for r in large_trades if r[3] == "buy"]
@@ -604,12 +596,11 @@ def render_depth_change_table(stats_rows):
         row += "</tr>"
         rows_html += row
 
-    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:13px">
-    <table style="width:100%;border-collapse:collapse;text-align:right">
+    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
-    </table></body></html>"""
-    components.html(html, height=40 + 30 * rows_html.count("<tr>"))
+    </table>"""
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_depth_chart(stats_rows, level_idx, side, hours=24):
@@ -625,10 +616,12 @@ def render_depth_chart(stats_rows, level_idx, side, hours=24):
     timestamps = [r[0] for r in filtered[SMOOTH_WINDOW - 1:]]
     timestamps, smoothed = downsample(timestamps, smoothed)
 
-    label = f"{'Bid' if side == 'bid' else 'Ask'} @ {DEPTH_LEVELS[level_idx]}%"
+    side_label = "Bid" if side == "bid" else "Ask"
+    level_label = f"{side_label} depth {DEPTH_LEVELS[level_idx]} pct"
     color = "#4caf50" if side == "bid" else "#f44336"
-    df = pd.DataFrame({"time": [ts_to_datetime(t) for t in timestamps], label: smoothed})
-    st.altair_chart(make_chart(df, label, color=color, height=200), use_container_width=True)
+    st.markdown(f"**{side_label} @ {DEPTH_LEVELS[level_idx]}% (15m avg)**")
+    df = pd.DataFrame({"time": [ts_to_datetime(t) for t in timestamps], level_label: smoothed})
+    st.altair_chart(make_chart(df, level_label, color=color, height=250), use_container_width=True)
 
 
 # ── Depth Events (WS fill/pull tracking) ───────────────────────────────────
@@ -667,14 +660,11 @@ def render_depth_events(conn, hours=24):
             f'</tr>'
         )
 
-    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:12px">
-    <table style="width:100%;border-collapse:collapse;text-align:right">
+    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.0">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
-    </table></body></html>"""
-
-    n_rows = min(len(events), 50)
-    components.html(html, height=40 + 24 * n_rows, scrolling=True)
+    </table>"""
+    st.markdown(html, unsafe_allow_html=True)
 
     # Summary: fills vs pulls
     fills = [e for e in events if e[3] in ("filled", "partially_filled")]
