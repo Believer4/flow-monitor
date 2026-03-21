@@ -6,8 +6,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
+import altair as alt
 import json
 import time
+from datetime import datetime, timezone
 from config import EXCHANGE, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS
 from db import (
     get_conn, get_vd_history, get_stats_history, get_candle_history,
@@ -62,6 +64,43 @@ def smooth(values, window):
 
 # ── Market Activity Section (CVD + Volume + Divergence) ─────────────────────
 
+def ts_to_datetime(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False):
+    """Create an Altair line chart with proper axis scaling."""
+    y_scale = alt.Scale(zero=y_zero)
+    chart = (
+        alt.Chart(df)
+        .mark_line(strokeWidth=1.5, color=color)
+        .encode(
+            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+            y=alt.Y(f"{y_col}:Q", scale=y_scale, title=y_col),
+            tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip(f"{y_col}:Q", format=",.2f")],
+        )
+        .properties(height=height)
+    )
+    return chart
+
+
+def make_bar_chart(df, height=150):
+    """Buy/sell volume bar chart."""
+    melted = df.melt(id_vars=["time"], value_vars=["Buy", "Sell"], var_name="Side", value_name="Volume")
+    chart = (
+        alt.Chart(melted)
+        .mark_bar(opacity=0.8)
+        .encode(
+            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+            y=alt.Y("Volume:Q", title="Volume ($)"),
+            color=alt.Color("Side:N", scale=alt.Scale(domain=["Buy", "Sell"], range=["#4caf50", "#f44336"]), legend=alt.Legend(orient="top")),
+            tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Side:N"), alt.Tooltip("Volume:Q", format=",.0f")],
+        )
+        .properties(height=height)
+    )
+    return chart
+
+
 def render_market_activity(vd_rows, candle_rows, hours=24):
     """Stacked: Price on top, raw CVD below, buy/sell volume bars at bottom."""
     cutoff = int(time.time()) - hours * 3600
@@ -75,56 +114,54 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     ts_cvd, cvd_raw = compute_cvd(vd_filtered)
     ts_price, prices = compute_price_series(candle_filtered)
 
-    # Convert CVD from USD to coins using price at each point
-    # Align prices to CVD timestamps
+    # Convert CVD from USD to coins
     price_map = {r[0]: r[4] for r in candle_filtered}
     cvd_coins = []
-    deltas_usd = [vd_filtered[i][1] for i in range(len(vd_filtered))]
     cumulative_coins = 0.0
-    for i, (ts, delta_usd) in enumerate(vd_filtered):
+    for ts, delta_usd in vd_filtered:
         p = price_map.get(ts, prices[-1] if prices else 1)
         if p > 0:
             cumulative_coins += delta_usd / p
         cvd_coins.append(cumulative_coins)
 
-    # Current CVD values
     current_cvd_coins = cvd_coins[-1] if cvd_coins else 0
     current_cvd_usd = cvd_raw[-1] if cvd_raw else 0
-    current_price = prices[-1] if prices else 0
 
-    # Show current CVD as metric
+    # Metrics
     col1, col2 = st.columns(2)
     col1.metric("CVD (coins)", f"{current_cvd_coins:+,.0f} FLOW")
     col2.metric("CVD (USD)", f"${current_cvd_usd:+,.0f}")
 
-    # Buy/sell volume per minute from candles
-    buy_vols = [r[5] for r in candle_filtered]
-    sell_vols = [-r[6] for r in candle_filtered]  # negative for display
-    ts_vol = [r[0] for r in candle_filtered]
-
-    # Downsample all
+    # Downsample
     ts_price_ds, prices_ds = downsample(ts_price, prices)
     ts_cvd_ds, cvd_coins_ds = downsample(ts_cvd, cvd_coins)
+
+    buy_vols = [r[5] for r in candle_filtered]
+    sell_vols = [r[6] for r in candle_filtered]
+    ts_vol = [r[0] for r in candle_filtered]
     ts_vol_ds, buy_ds = downsample(ts_vol, buy_vols)
     _, sell_ds = downsample(ts_vol, sell_vols)
 
     # Price chart
     st.markdown("**Price**")
-    df_price = pd.DataFrame({"Price": prices_ds}, index=[ts_to_label(t) for t in ts_price_ds])
-    st.line_chart(df_price, height=200, use_container_width=True)
+    df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
+    st.altair_chart(make_chart(df_price, "Price", color="#4fc3f7"), use_container_width=True)
 
-    # Raw CVD in coins
+    # CVD chart
     st.markdown("**CVD (net coins bought)**")
-    df_cvd = pd.DataFrame({"CVD (FLOW)": cvd_coins_ds}, index=[ts_to_label(t) for t in ts_cvd_ds])
-    st.line_chart(df_cvd, height=200, use_container_width=True)
+    df_cvd = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_cvd_ds], "CVD": cvd_coins_ds})
+    # Color based on direction
+    cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
+    st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color), use_container_width=True)
 
-    # Buy/sell volume bars
+    # Volume bars
     st.markdown("**Buy / Sell Volume ($)**")
-    df_vol = pd.DataFrame(
-        {"Buy": buy_ds, "Sell": sell_ds},
-        index=[ts_to_label(t) for t in ts_vol_ds]
-    )
-    st.bar_chart(df_vol, height=150, use_container_width=True, color=["#4caf50", "#f44336"])
+    df_vol = pd.DataFrame({
+        "time": [ts_to_datetime(t) for t in ts_vol_ds],
+        "Buy": buy_ds,
+        "Sell": [-s for s in sell_ds],  # negative for visual separation
+    })
+    st.altair_chart(make_bar_chart(df_vol), use_container_width=True)
 
 
 def render_divergence(vd_rows, candle_rows, window=60):

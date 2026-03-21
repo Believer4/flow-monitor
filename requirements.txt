@@ -2,4 +2,5 @@ requests
 python-dotenv
 streamlit
 numpy
+altair
 websocket-client
