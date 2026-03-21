@@ -464,7 +464,7 @@ def main():
 
     # ── 2. NOTABLE TRADES ──
     st.markdown("## 2. Notable Trades (z-score > 2σ)")
-    st.caption("Large individual fills detected via WebSocket. Whale buys/sells and TWAP patterns.")
+    st.caption("Trades >2σ vs last 12h of trades. Detected via WebSocket. Includes TWAP pattern detection.")
 
     render_notable_trades(conn, hours=hours)
     render_trade_intensity(conn, hours=hours)

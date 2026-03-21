@@ -31,12 +31,12 @@ API_KEY = os.getenv("MMT_API_KEY")
 WS_URL = f"wss://eu-central-1.mmt.gg/api/v1/ws?api_key={API_KEY}&format=json"
 
 # Z-score config
-ZSCORE_WINDOW = 500  # rolling window of last N trades for mean/std
+ZSCORE_LOOKBACK = 12 * 3600  # 12 hours of trades for z-score reference
 ZSCORE_THRESHOLD = 2.0  # flag trades above this z-score
 TWAP_CHECK_INTERVAL = 300  # check for TWAP patterns every 5 min
 
-# Rolling buffer for z-score calculation
-trade_sizes = deque(maxlen=ZSCORE_WINDOW)
+# Rolling buffer: (timestamp, size_usd) — keeps 12h window
+trade_history = []  # list of (ts, size_usd), pruned periodically
 # Buffer for batch inserts
 trade_buffer = []
 BUFFER_FLUSH_INTERVAL = 10  # flush every 10 seconds
@@ -46,13 +46,21 @@ recent_buys = deque(maxlen=200)  # (timestamp, size) of recent buys
 recent_sells = deque(maxlen=200)
 
 
+def prune_history():
+    """Remove trades older than 12h from the reference window."""
+    global trade_history
+    cutoff = time.time() - ZSCORE_LOOKBACK
+    trade_history = [(ts, s) for ts, s in trade_history if ts >= cutoff]
+
+
 def compute_z_score(value):
-    """Compute z-score of value against rolling window."""
-    if len(trade_sizes) < 30:
+    """Compute z-score of value against last 12h of trades."""
+    prune_history()
+    if len(trade_history) < 30:
         return 0.0
-    arr = np.array(trade_sizes)
-    mean = arr.mean()
-    std = arr.std()
+    sizes = np.array([s for _, s in trade_history])
+    mean = sizes.mean()
+    std = sizes.std()
     if std == 0:
         return 0.0
     return (value - mean) / std
@@ -130,12 +138,12 @@ def on_message(ws, message):
         ts = ts / 1000
 
     size_usd = price * qty
-    trade_sizes.append(size_usd)
+    trade_history.append((ts, size_usd))
     z = compute_z_score(size_usd)
     is_large = 1 if z >= ZSCORE_THRESHOLD else 0
 
     trade = {
-        "ts": ts if isinstance(ts, (int, float)) else ts / 1000,  # handle ms timestamps
+        "ts": ts,
         "price": price,
         "size_usd": size_usd,
         "side": side,
