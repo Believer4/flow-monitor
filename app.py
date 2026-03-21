@@ -85,18 +85,19 @@ def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False):
 
 
 def make_bar_chart(df, height=150):
-    """Buy/sell volume bar chart."""
+    """Buy/sell volume bar chart with proper bar width."""
     melted = df.melt(id_vars=["time"], value_vars=["Buy", "Sell"], var_name="Side", value_name="Volume")
     chart = (
         alt.Chart(melted)
         .mark_bar(opacity=0.8)
         .encode(
             x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
-            y=alt.Y("Volume:Q", title="Volume ($)"),
+            y=alt.Y("Volume:Q", title="Volume ($)", stack=None),
             color=alt.Color("Side:N", scale=alt.Scale(domain=["Buy", "Sell"], range=["#4caf50", "#f44336"]), legend=alt.Legend(orient="top")),
+            xOffset="Side:N",
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Side:N"), alt.Tooltip("Volume:Q", format=",.0f")],
         )
-        .properties(height=height)
+        .properties(height=height, width="container")
     )
     return chart
 
@@ -228,7 +229,7 @@ def render_book_narrative(stats_rows, hours=24):
     if len(filtered) < 10:
         return
 
-    # Get start and end depth (smoothed over 15 min at each end)
+    # Smoothed start and end depth (15-min avg at each end)
     start_rows = filtered[:min(15, len(filtered))]
     end_rows = filtered[-min(15, len(filtered)):]
 
@@ -241,33 +242,86 @@ def render_book_narrative(stats_rows, hours=24):
     ask_start = avg_depth(start_rows, 3)
     ask_end = avg_depth(end_rows, 3)
 
-    last_price = filtered[-1][1]
+    start_price = filtered[0][1]
+    end_price = filtered[-1][1]
+    last_price = end_price
     valid = valid_level_indices(last_price)
 
-    # Build narrative lines
-    lines = []
+    # Compute total buy/sell volume over the window from stats
+    total_buy = sum(r[5] for r in filtered)
+    total_sell = sum(r[6] for r in filtered)
+    net_vol = total_buy - total_sell
+
+    # Per-level analysis
+    level_analysis = []
     for i in valid:
         level = DEPTH_LEVELS[i]
         bid_chg = ((bid_end[i] - bid_start[i]) / bid_start[i] * 100) if bid_start[i] > 0 else 0
         ask_chg = ((ask_end[i] - ask_start[i]) / ask_start[i] * 100) if ask_start[i] > 0 else 0
+        bid_delta = bid_end[i] - bid_start[i]
+        ask_delta = ask_end[i] - ask_start[i]
 
-        parts = []
-        if abs(bid_chg) > 10:
-            direction = "thickened" if bid_chg > 0 else "thinned"
-            parts.append(f"Bids {direction} {abs(bid_chg):.0f}% (${bid_start[i]:,.0f} → ${bid_end[i]:,.0f})")
-        if abs(ask_chg) > 10:
-            direction = "thickened" if ask_chg > 0 else "thinned"
-            parts.append(f"Asks {direction} {abs(ask_chg):.0f}% (${ask_start[i]:,.0f} → ${ask_end[i]:,.0f})")
+        # Price range this level covers
+        level_price_low = last_price * (1 - level / 100)
+        level_price_high = last_price * (1 + level / 100)
 
-        if parts:
-            lines.append(f"**{level}%:** " + " | ".join(parts))
+        # Did price trade through this level?
+        all_prices = [r[1] for r in filtered if r[1] > 0]
+        price_low = min(all_prices) if all_prices else last_price
+        price_high = max(all_prices) if all_prices else last_price
+        traded_below = price_low <= level_price_low
+        traded_above = price_high >= level_price_high
 
-    if lines:
-        st.markdown("**What changed in the book:**")
-        for line in lines:
-            st.markdown(f"- {line}")
-    else:
-        st.caption("No significant depth changes over this window.")
+        entry = {"level": level, "bid_chg": bid_chg, "ask_chg": ask_chg,
+                 "bid_start": bid_start[i], "bid_end": bid_end[i],
+                 "ask_start": ask_start[i], "ask_end": ask_end[i],
+                 "bid_delta": bid_delta, "ask_delta": ask_delta,
+                 "traded_below": traded_below, "traded_above": traded_above}
+        level_analysis.append(entry)
+
+    # Build HTML table
+    header = "<tr><th>Level</th><th>Bid Start</th><th>Bid End</th><th>Bid Δ</th><th>Ask Start</th><th>Ask End</th><th>Ask Δ</th><th>Interpretation</th></tr>"
+    rows_html = ""
+    for a in level_analysis:
+        bc = "#4caf50" if a["bid_chg"] > 10 else "#f44336" if a["bid_chg"] < -10 else "#888"
+        ac = "#4caf50" if a["ask_chg"] > 10 else "#f44336" if a["ask_chg"] < -10 else "#888"
+
+        # Interpretation
+        interp = []
+        if a["bid_chg"] < -20 and a["traded_below"]:
+            interp.append("bids filled (price traded through)")
+        elif a["bid_chg"] < -20:
+            interp.append("bids pulled (not filled)")
+        elif a["bid_chg"] > 20:
+            interp.append("new bids placed")
+
+        if a["ask_chg"] < -20 and a["traded_above"]:
+            interp.append("asks filled (bought through)")
+        elif a["ask_chg"] < -20:
+            interp.append("asks pulled")
+        elif a["ask_chg"] > 20:
+            interp.append("new asks placed")
+
+        interp_text = "; ".join(interp) if interp else "—"
+
+        rows_html += (
+            f'<tr><td>{a["level"]}%</td>'
+            f'<td>${a["bid_start"]:,.0f}</td><td>${a["bid_end"]:,.0f}</td>'
+            f'<td style="color:{bc}">{a["bid_chg"]:+.0f}%</td>'
+            f'<td>${a["ask_start"]:,.0f}</td><td>${a["ask_end"]:,.0f}</td>'
+            f'<td style="color:{ac}">{a["ask_chg"]:+.0f}%</td>'
+            f'<td style="text-align:left;font-size:11px">{interp_text}</td></tr>'
+        )
+
+    st.markdown("**What changed in the book:**")
+    st.caption(f"Total volume: ${total_buy + total_sell:,.0f} (Buy ${total_buy:,.0f} / Sell ${total_sell:,.0f}) | Net: ${net_vol:+,.0f}")
+
+    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:12px">
+    <table style="width:100%;border-collapse:collapse;text-align:right">
+    <thead style="border-bottom:1px solid #333">{header}</thead>
+    <tbody>{rows_html}</tbody>
+    </table></body></html>"""
+    components.html(html, height=40 + 30 * rows_html.count("<tr>"))
 
 
 # ── Trades Section ──────────────────────────────────────────────────────────
