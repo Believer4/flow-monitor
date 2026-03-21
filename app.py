@@ -154,58 +154,69 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
     st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color), use_container_width=True)
 
-    # Volume bars
+    # Volume bars — both positive, side by side
     st.markdown("**Buy / Sell Volume ($)**")
     df_vol = pd.DataFrame({
         "time": [ts_to_datetime(t) for t in ts_vol_ds],
         "Buy": buy_ds,
-        "Sell": [-s for s in sell_ds],  # negative for visual separation
+        "Sell": sell_ds,
     })
     st.altair_chart(make_bar_chart(df_vol), use_container_width=True)
 
 
-def render_divergence(vd_rows, candle_rows, window=60):
-    """CVD vs Price divergence detector."""
-    cutoff = int(time.time()) - 24 * 3600
+def render_divergence(vd_rows, candle_rows, hours=24):
+    """CVD vs Price divergence detector over the selected time window."""
+    cutoff = int(time.time()) - hours * 3600
     vd_filtered = [(t, v) for t, v in vd_rows if t >= cutoff]
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
 
-    if len(vd_filtered) < window + 1 or len(candle_filtered) < window + 1:
-        st.info("Not enough data for divergence (need 24h+)")
+    if len(vd_filtered) < 60 or len(candle_filtered) < 60:
+        st.info("Not enough data for divergence")
         return
 
     _, cvd = compute_cvd(vd_filtered)
-    ts_price, prices = compute_price_series(candle_filtered)
+    _, prices = compute_price_series(candle_filtered)
 
     n = min(len(cvd), len(prices))
     cvd = cvd[:n]
     prices = prices[:n]
 
-    # Latest 60-min rate of change
-    cvd_change = cvd[-1] - cvd[-1 - window]
-    price_start = prices[-1 - window]
-    price_roc = ((prices[-1] - price_start) / price_start * 100) if price_start > 0 else 0
-    cvd_abs_mean = np.mean(np.abs(cvd[-window:]))
-    cvd_roc = (cvd_change / cvd_abs_mean * 100) if cvd_abs_mean > 0 else 0
+    # Rate of change over the full window
+    price_roc = ((prices[-1] - prices[0]) / prices[0] * 100) if prices[0] > 0 else 0
+    cvd_direction = "rising" if cvd[-1] > cvd[n // 2] else "falling"
+    cvd_total = cvd[-1] - cvd[0]
 
-    if cvd_roc > 10 and price_roc < 1:
+    # Classify based on actual price movement + CVD direction
+    price_flat = abs(price_roc) < 0.5
+    price_up = price_roc > 0.5
+    price_down = price_roc < -0.5
+    cvd_up = cvd_total > 0
+    cvd_down = cvd_total < 0
+
+    if cvd_up and price_flat:
         state = "CVD rising, price flat → absorption (bids absorbing sells)"
         color = "#4caf50"
-    elif cvd_roc < -10 and price_roc > -1:
+    elif cvd_down and price_flat:
         state = "CVD falling, price flat → distribution (asks absorbing buys)"
         color = "#f44336"
-    elif price_roc > 1 and cvd_roc < -5:
+    elif price_up and cvd_down:
         state = "Price rising, CVD falling → rising on thin air"
         color = "#ff9800"
-    elif price_roc < -1 and cvd_roc > 5:
-        state = "Price falling, CVD rising → selling on thin air"
+    elif price_down and cvd_up:
+        state = "Price falling, CVD rising → buying into weakness"
         color = "#ff9800"
+    elif price_down and cvd_down:
+        state = "Price down, CVD down → selling pressure confirmed"
+        color = "#f44336"
+    elif price_up and cvd_up:
+        state = "Price up, CVD up → buying pressure confirmed"
+        color = "#4caf50"
     else:
         state = "No significant divergence"
         color = "#888"
 
     st.markdown(f'<span style="color:{color};font-size:14px">**{state}**</span>', unsafe_allow_html=True)
-    st.caption(f"60-min CVD RoC: {cvd_roc:+.1f}% | Price RoC: {price_roc:+.2f}%")
+    st.caption(f"Window: {hours}h | Price: {price_roc:+.2f}% | Net CVD: {cvd_total:+,.0f} coins")
 
 
 # ── Trades Section ──────────────────────────────────────────────────────────
@@ -424,7 +435,7 @@ def main():
 
     # Divergence
     st.markdown("### CVD vs Price Divergence")
-    render_divergence(vd_rows, candle_rows)
+    render_divergence(vd_rows, candle_rows, hours=hours)
 
     st.divider()
 
