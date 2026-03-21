@@ -17,7 +17,6 @@ from db import (
 st.set_page_config(page_title="FLOW Monitor", layout="wide")
 
 SMOOTH_WINDOW = 15  # 15-minute rolling average
-CVD_SMOOTH = 15  # CVD smoothing window
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -64,7 +63,7 @@ def smooth(values, window):
 # ── Market Activity Section (CVD + Volume + Divergence) ─────────────────────
 
 def render_market_activity(vd_rows, candle_rows, hours=24):
-    """Stacked: Price on top, CVD (smoothed) below, buy/sell volume bars at bottom."""
+    """Stacked: Price on top, raw CVD below, buy/sell volume bars at bottom."""
     cutoff = int(time.time()) - hours * 3600
     vd_filtered = [(t, v) for t, v in vd_rows if t >= cutoff]
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
@@ -76,19 +75,27 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     ts_cvd, cvd_raw = compute_cvd(vd_filtered)
     ts_price, prices = compute_price_series(candle_filtered)
 
-    # Smooth CVD
-    cvd_smoothed = smooth(cvd_raw, CVD_SMOOTH)
-    ts_cvd_smooth = ts_cvd[CVD_SMOOTH - 1:] if len(ts_cvd) >= CVD_SMOOTH else ts_cvd
+    # Convert CVD from USD to coins using price at each point
+    # Align prices to CVD timestamps
+    price_map = {r[0]: r[4] for r in candle_filtered}
+    cvd_coins = []
+    deltas_usd = [vd_filtered[i][1] for i in range(len(vd_filtered))]
+    cumulative_coins = 0.0
+    for i, (ts, delta_usd) in enumerate(vd_filtered):
+        p = price_map.get(ts, prices[-1] if prices else 1)
+        if p > 0:
+            cumulative_coins += delta_usd / p
+        cvd_coins.append(cumulative_coins)
 
-    # CVD slope (rate of change over 60 min)
-    slope_window = 60
-    cvd_slope = []
-    ts_slope = []
-    if len(cvd_smoothed) > slope_window:
-        for i in range(slope_window, len(cvd_smoothed)):
-            slope = cvd_smoothed[i] - cvd_smoothed[i - slope_window]
-            cvd_slope.append(slope)
-            ts_slope.append(ts_cvd_smooth[i])
+    # Current CVD values
+    current_cvd_coins = cvd_coins[-1] if cvd_coins else 0
+    current_cvd_usd = cvd_raw[-1] if cvd_raw else 0
+    current_price = prices[-1] if prices else 0
+
+    # Show current CVD as metric
+    col1, col2 = st.columns(2)
+    col1.metric("CVD (coins)", f"{current_cvd_coins:+,.0f} FLOW")
+    col2.metric("CVD (USD)", f"${current_cvd_usd:+,.0f}")
 
     # Buy/sell volume per minute from candles
     buy_vols = [r[5] for r in candle_filtered]
@@ -97,7 +104,7 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
 
     # Downsample all
     ts_price_ds, prices_ds = downsample(ts_price, prices)
-    ts_cvd_ds, cvd_ds = downsample(ts_cvd_smooth, cvd_smoothed)
+    ts_cvd_ds, cvd_coins_ds = downsample(ts_cvd, cvd_coins)
     ts_vol_ds, buy_ds = downsample(ts_vol, buy_vols)
     _, sell_ds = downsample(ts_vol, sell_vols)
 
@@ -106,21 +113,13 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     df_price = pd.DataFrame({"Price": prices_ds}, index=[ts_to_label(t) for t in ts_price_ds])
     st.line_chart(df_price, height=200, use_container_width=True)
 
-    # CVD smoothed chart
-    st.markdown(f"**CVD (Cumulative Volume Delta) — {CVD_SMOOTH}m smoothed**")
-    df_cvd = pd.DataFrame({"CVD ($)": cvd_ds}, index=[ts_to_label(t) for t in ts_cvd_ds])
+    # Raw CVD in coins
+    st.markdown("**CVD (net coins bought)**")
+    df_cvd = pd.DataFrame({"CVD (FLOW)": cvd_coins_ds}, index=[ts_to_label(t) for t in ts_cvd_ds])
     st.line_chart(df_cvd, height=200, use_container_width=True)
 
-    # CVD slope
-    if cvd_slope:
-        st.markdown("**CVD Slope (60-min rate of change)**")
-        st.caption("Positive = buying accelerating, Negative = buying decelerating")
-        ts_slope_ds, slope_ds = downsample(ts_slope, cvd_slope)
-        df_slope = pd.DataFrame({"Slope ($)": slope_ds}, index=[ts_to_label(t) for t in ts_slope_ds])
-        st.line_chart(df_slope, height=150, use_container_width=True)
-
     # Buy/sell volume bars
-    st.markdown("**Buy / Sell Volume**")
+    st.markdown("**Buy / Sell Volume ($)**")
     df_vol = pd.DataFrame(
         {"Buy": buy_ds, "Sell": sell_ds},
         index=[ts_to_label(t) for t in ts_vol_ds]
