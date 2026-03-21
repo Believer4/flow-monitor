@@ -52,6 +52,29 @@ def init_db():
             sell_vol REAL,
             PRIMARY KEY (timestamp, exchange, symbol)
         );
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL,
+            size_usd REAL,
+            side TEXT,
+            is_large INTEGER DEFAULT 0,
+            z_score REAL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(exchange, symbol, timestamp);
+
+        CREATE TABLE IF NOT EXISTS custom_depth (
+            timestamp INTEGER NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            last_price REAL,
+            bid_depth_25 REAL,
+            ask_depth_25 REAL,
+            PRIMARY KEY (timestamp, exchange, symbol)
+        );
     """)
     conn.close()
 
@@ -88,6 +111,66 @@ def insert_candles(conn, exchange, symbol, records):
         [(r["t"], exchange, symbol, r["o"], r["h"], r["l"], r["c"], r.get("vb", 0), r.get("vs", 0)) for r in records]
     )
     conn.commit()
+
+
+def insert_custom_depth(conn, exchange, symbol, timestamp, last_price, bid_25, ask_25):
+    conn.execute(
+        "INSERT OR IGNORE INTO custom_depth (timestamp, exchange, symbol, last_price, bid_depth_25, ask_depth_25) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (timestamp, exchange, symbol, last_price, bid_25, ask_25)
+    )
+    conn.commit()
+
+
+def get_custom_depth_history(conn, exchange, symbol, from_ts=None):
+    q = "SELECT timestamp, last_price, bid_depth_25, ask_depth_25 FROM custom_depth WHERE exchange=? AND symbol=? "
+    params = [exchange, symbol]
+    if from_ts:
+        q += "AND timestamp >= ? "
+        params.append(from_ts)
+    q += "ORDER BY timestamp"
+    return conn.execute(q, params).fetchall()
+
+
+def insert_trade(conn, exchange, symbol, timestamp, price, size_usd, side, is_large=0, z_score=0.0):
+    conn.execute(
+        "INSERT INTO trades (timestamp, exchange, symbol, price, size_usd, side, is_large, z_score) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (timestamp, exchange, symbol, price, size_usd, side, is_large, z_score)
+    )
+    conn.commit()
+
+
+def insert_trades_batch(conn, exchange, symbol, trades):
+    conn.executemany(
+        "INSERT INTO trades (timestamp, exchange, symbol, price, size_usd, side, is_large, z_score) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(t["ts"], exchange, symbol, t["price"], t["size_usd"], t["side"], t.get("is_large", 0), t.get("z_score", 0.0)) for t in trades]
+    )
+    conn.commit()
+
+
+def get_trades_history(conn, exchange, symbol, from_ts=None, large_only=False):
+    q = "SELECT timestamp, price, size_usd, side, is_large, z_score FROM trades WHERE exchange=? AND symbol=? "
+    params = [exchange, symbol]
+    if from_ts:
+        q += "AND timestamp >= ? "
+        params.append(from_ts)
+    if large_only:
+        q += "AND is_large = 1 "
+    q += "ORDER BY timestamp"
+    return conn.execute(q, params).fetchall()
+
+
+def get_trade_stats(conn, exchange, symbol, from_ts, to_ts):
+    """Get trade count and volume per minute bucket."""
+    q = """SELECT CAST(timestamp/60 AS INTEGER)*60 as bucket,
+           COUNT(*) as count,
+           SUM(CASE WHEN side='buy' THEN size_usd ELSE 0 END) as buy_vol,
+           SUM(CASE WHEN side='sell' THEN size_usd ELSE 0 END) as sell_vol
+           FROM trades WHERE exchange=? AND symbol=? AND timestamp >= ? AND timestamp <= ?
+           GROUP BY bucket ORDER BY bucket"""
+    return conn.execute(q, (exchange, symbol, from_ts, to_ts)).fetchall()
 
 
 def get_vd_history(conn, exchange, symbol, from_ts=None):

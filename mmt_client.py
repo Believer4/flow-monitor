@@ -35,6 +35,12 @@ class MMTClient:
         r.raise_for_status()
         return r.json()
 
+    def get_orderbook(self, exchange, symbol, levels="full"):
+        params = {"exchange": exchange, "symbol": symbol, "levels": levels}
+        r = self.session.get(f"{BASE_URL}/api/v1/orderbook", params=params)
+        r.raise_for_status()
+        return r.json()
+
     def get_candles(self, exchange, symbol, tf="1m", from_ts=None, to_ts=None):
         params = {"exchange": exchange, "symbol": symbol, "tf": tf}
         if from_ts:
