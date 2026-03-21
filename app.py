@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from config import EXCHANGE, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS
 from db import (
     get_conn, get_vd_history, get_stats_history, get_candle_history,
-    get_trades_history, get_trade_stats,
+    get_trades_history, get_trade_stats, get_depth_events,
 )
 
 st.set_page_config(page_title="FLOW Monitor", layout="wide")
@@ -85,21 +85,19 @@ def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False):
 
 
 def make_bar_chart(df, height=150):
-    """Buy/sell volume bar chart with proper bar width."""
-    melted = df.melt(id_vars=["time"], value_vars=["Buy", "Sell"], var_name="Side", value_name="Volume")
-    chart = (
-        alt.Chart(melted)
-        .mark_bar(opacity=0.8)
-        .encode(
-            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
-            y=alt.Y("Volume:Q", title="Volume ($)", stack=None),
-            color=alt.Color("Side:N", scale=alt.Scale(domain=["Buy", "Sell"], range=["#4caf50", "#f44336"]), legend=alt.Legend(orient="top")),
-            xOffset="Side:N",
-            tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Side:N"), alt.Tooltip("Volume:Q", format=",.0f")],
-        )
-        .properties(height=height, width="container")
+    """Buy/sell volume bar chart — layered approach for Altair 6 compatibility."""
+    base = alt.Chart(df).encode(
+        x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
     )
-    return chart
+    buy_bars = base.mark_bar(color="#4caf50", opacity=0.7).encode(
+        y=alt.Y("Buy:Q", title="Volume ($)"),
+        tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Buy:Q", format=",.0f", title="Buy $")],
+    )
+    sell_bars = base.mark_bar(color="#f44336", opacity=0.7).encode(
+        y=alt.Y("Sell:Q"),
+        tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Sell:Q", format=",.0f", title="Sell $")],
+    )
+    return alt.layer(buy_bars, sell_bars).properties(height=height)
 
 
 def render_market_activity(vd_rows, candle_rows, hours=24):
@@ -498,6 +496,62 @@ def render_depth_chart(stats_rows, level_idx, side, hours=24):
     st.line_chart(df, height=200)
 
 
+# ── Depth Events (WS fill/pull tracking) ───────────────────────────────────
+
+def render_depth_events(conn, hours=24):
+    """Show recent order book events: fills, pulls, new orders from WS depth tracking."""
+    cutoff = int(time.time()) - hours * 3600
+    events = get_depth_events(conn, EXCHANGE, SYMBOL, from_ts=cutoff, min_usd=500)
+
+    if not events:
+        st.caption("No depth events yet. Start trades_collector.py for live order book tracking.")
+        return
+
+    st.markdown("**Order Book Events (live)**")
+    st.caption("Real-time fill/pull detection from WebSocket depth stream")
+
+    # events: (timestamp, price, side, event_type, size_before, size_after, size_usd, filled)
+    header = "<tr><th>Time</th><th>Side</th><th>Type</th><th>Price</th><th>Size $</th><th>Before→After</th></tr>"
+    rows_html = ""
+    for row in events[:50]:
+        ts, price, side, event_type, size_before, size_after, size_usd, filled = row
+        type_colors = {
+            "filled": "#4caf50", "pulled": "#f44336", "added": "#4fc3f7",
+            "partially_filled": "#ff9800", "reduced": "#ff9800",
+        }
+        tc = type_colors.get(event_type, "#888")
+        sc = "#4caf50" if side == "bid" else "#f44336"
+        rows_html += (
+            f'<tr>'
+            f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(ts))}</td>'
+            f'<td style="color:{sc}">{side.upper()}</td>'
+            f'<td style="color:{tc};font-weight:bold">{event_type.upper()}</td>'
+            f'<td>{price:.4f}</td>'
+            f'<td>${size_usd:,.0f}</td>'
+            f'<td>${size_before:,.0f}→${size_after:,.0f}</td>'
+            f'</tr>'
+        )
+
+    html = f"""<html><body style="margin:0;background:#0e1117;color:#fafafa;font-family:monospace;font-size:12px">
+    <table style="width:100%;border-collapse:collapse;text-align:right">
+    <thead style="border-bottom:1px solid #333">{header}</thead>
+    <tbody>{rows_html}</tbody>
+    </table></body></html>"""
+
+    n_rows = min(len(events), 50)
+    components.html(html, height=40 + 24 * n_rows, scrolling=True)
+
+    # Summary: fills vs pulls
+    fills = [e for e in events if e[3] in ("filled", "partially_filled")]
+    pulls = [e for e in events if e[3] == "pulled"]
+    added = [e for e in events if e[3] == "added"]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Filled", f"{len(fills)} (${sum(e[6] for e in fills):,.0f})")
+    col2.metric("Pulled", f"{len(pulls)} (${sum(e[6] for e in pulls):,.0f})")
+    col3.metric("Added", f"{len(added)} (${sum(e[6] for e in added):,.0f})")
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -542,6 +596,9 @@ def main():
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
     render_book_narrative(stats_rows, hours=hours)
+
+    # Depth events (fill/pull from WS)
+    render_depth_events(conn, hours=hours)
 
     st.divider()
 

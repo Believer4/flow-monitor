@@ -75,8 +75,48 @@ def init_db():
             ask_depth_25 REAL,
             PRIMARY KEY (timestamp, exchange, symbol)
         );
+
+        CREATE TABLE IF NOT EXISTS depth_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL,
+            side TEXT,
+            event_type TEXT,
+            size_before REAL,
+            size_after REAL,
+            size_usd REAL,
+            filled INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_depth_events_ts ON depth_events(exchange, symbol, timestamp);
     """)
     conn.close()
+
+
+def insert_depth_events(conn, exchange, symbol, events):
+    conn.executemany(
+        "INSERT INTO depth_events (timestamp, exchange, symbol, price, side, event_type, size_before, size_after, size_usd, filled) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(e["ts"], exchange, symbol, e["price"], e["side"], e["type"],
+          e.get("size_before", 0), e.get("size_after", 0), e.get("size_usd", 0), e.get("filled", 0))
+         for e in events]
+    )
+    conn.commit()
+
+
+def get_depth_events(conn, exchange, symbol, from_ts=None, min_usd=0):
+    q = "SELECT timestamp, price, side, event_type, size_before, size_after, size_usd, filled FROM depth_events WHERE exchange=? AND symbol=? "
+    params = [exchange, symbol]
+    if from_ts:
+        q += "AND timestamp >= ? "
+        params.append(from_ts)
+    if min_usd > 0:
+        q += "AND size_usd >= ? "
+        params.append(min_usd)
+    q += "ORDER BY timestamp DESC LIMIT 200"
+    return conn.execute(q, params).fetchall()
 
 
 def insert_vd(conn, exchange, symbol, records):
