@@ -154,14 +154,13 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
     st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color), use_container_width=True)
 
-    # Volume bars — both positive, side by side
-    st.markdown("**Buy / Sell Volume ($)**")
-    df_vol = pd.DataFrame({
-        "time": [ts_to_datetime(t) for t in ts_vol_ds],
-        "Buy": buy_ds,
-        "Sell": sell_ds,
-    })
-    st.altair_chart(make_bar_chart(df_vol), use_container_width=True)
+    # Volume bars — aggregate into hourly buckets so bars are visible
+    st.markdown("**Buy / Sell Volume ($) — hourly**")
+    vol_df = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_vol], "Buy": buy_vols, "Sell": sell_vols})
+    vol_df["hour"] = vol_df["time"].dt.floor("h")
+    vol_hourly = vol_df.groupby("hour").agg({"Buy": "sum", "Sell": "sum"}).reset_index()
+    vol_hourly.rename(columns={"hour": "time"}, inplace=True)
+    st.altair_chart(make_bar_chart(vol_hourly), use_container_width=True)
 
 
 def render_divergence(vd_rows, candle_rows, hours=24):
@@ -217,6 +216,58 @@ def render_divergence(vd_rows, candle_rows, hours=24):
 
     st.markdown(f'<span style="color:{color};font-size:14px">**{state}**</span>', unsafe_allow_html=True)
     st.caption(f"Window: {hours}h | Price: {price_roc:+.2f}% | Net CVD: {cvd_total:+,.0f} coins")
+
+    return {"price_roc": price_roc, "cvd_total": cvd_total, "state": state}
+
+
+def render_book_narrative(stats_rows, hours=24):
+    """Correlate depth changes with market activity over the same window."""
+    cutoff = int(time.time()) - hours * 3600
+    filtered = [r for r in stats_rows if r[0] >= cutoff]
+
+    if len(filtered) < 10:
+        return
+
+    # Get start and end depth (smoothed over 15 min at each end)
+    start_rows = filtered[:min(15, len(filtered))]
+    end_rows = filtered[-min(15, len(filtered)):]
+
+    def avg_depth(rows, field_idx):
+        vals = [json.loads(r[field_idx]) for r in rows]
+        return [sum(v[i] for v in vals) / len(vals) for i in range(7)]
+
+    bid_start = avg_depth(start_rows, 2)
+    bid_end = avg_depth(end_rows, 2)
+    ask_start = avg_depth(start_rows, 3)
+    ask_end = avg_depth(end_rows, 3)
+
+    last_price = filtered[-1][1]
+    valid = valid_level_indices(last_price)
+
+    # Build narrative lines
+    lines = []
+    for i in valid:
+        level = DEPTH_LEVELS[i]
+        bid_chg = ((bid_end[i] - bid_start[i]) / bid_start[i] * 100) if bid_start[i] > 0 else 0
+        ask_chg = ((ask_end[i] - ask_start[i]) / ask_start[i] * 100) if ask_start[i] > 0 else 0
+
+        parts = []
+        if abs(bid_chg) > 10:
+            direction = "thickened" if bid_chg > 0 else "thinned"
+            parts.append(f"Bids {direction} {abs(bid_chg):.0f}% (${bid_start[i]:,.0f} → ${bid_end[i]:,.0f})")
+        if abs(ask_chg) > 10:
+            direction = "thickened" if ask_chg > 0 else "thinned"
+            parts.append(f"Asks {direction} {abs(ask_chg):.0f}% (${ask_start[i]:,.0f} → ${ask_end[i]:,.0f})")
+
+        if parts:
+            lines.append(f"**{level}%:** " + " | ".join(parts))
+
+    if lines:
+        st.markdown("**What changed in the book:**")
+        for line in lines:
+            st.markdown(f"- {line}")
+    else:
+        st.caption("No significant depth changes over this window.")
 
 
 # ── Trades Section ──────────────────────────────────────────────────────────
@@ -433,9 +484,10 @@ def main():
 
     render_market_activity(vd_rows, candle_rows, hours=hours)
 
-    # Divergence
+    # Divergence + book narrative
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
+    render_book_narrative(stats_rows, hours=hours)
 
     st.divider()
 
