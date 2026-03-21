@@ -140,36 +140,36 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     ts_vol_ds, buy_ds = downsample(ts_vol, buy_vols)
     _, sell_ds = downsample(ts_vol, sell_vols)
 
-    # Price chart with regime boundary markers
+    # Price chart with 4h high/low markers
     st.markdown("**Price**")
     df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
     price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300)
 
-    # Detect regimes and add boundary dots
-    regimes = detect_regimes(candle_filtered)
-    if regimes:
-        boundary_times = []
-        boundary_prices = []
-        boundary_dirs = []
-        for start_idx, end_idx, direction in regimes:
-            boundary_times.append(ts_to_datetime(candle_filtered[start_idx][0]))
-            boundary_prices.append(candle_filtered[start_idx][4])
-            boundary_dirs.append(direction)
-            boundary_times.append(ts_to_datetime(candle_filtered[end_idx][0]))
-            boundary_prices.append(candle_filtered[end_idx][4])
-            boundary_dirs.append(direction)
+    # Compute 4h high/low points
+    buckets_4h = get_4h_buckets(candle_filtered)
+    if buckets_4h:
+        hl_times, hl_prices, hl_types = [], [], []
+        for b in buckets_4h:
+            hl_times.append(ts_to_datetime(b["high_ts"]))
+            hl_prices.append(b["high"])
+            hl_types.append("4h high")
+            hl_times.append(ts_to_datetime(b["low_ts"]))
+            hl_prices.append(b["low"])
+            hl_types.append("4h low")
 
-        df_dots = pd.DataFrame({"time": boundary_times, "Price": boundary_prices, "dir": boundary_dirs})
+        df_hl = pd.DataFrame({"time": hl_times, "Price": hl_prices, "type": hl_types})
         dots = (
-            alt.Chart(df_dots)
-            .mark_circle(size=60)
+            alt.Chart(df_hl)
+            .mark_point(size=80, filled=True)
             .encode(
                 x="time:T",
                 y=alt.Y("Price:Q", scale=alt.Scale(zero=False)),
-                color=alt.Color("dir:N",
-                    scale=alt.Scale(domain=["up", "down"], range=["#4caf50", "#f44336"]),
-                    legend=alt.Legend(title="Regime", orient="top")),
-                tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Price:Q", format=".4f"), "dir:N"],
+                color=alt.Color("type:N",
+                    scale=alt.Scale(domain=["4h high", "4h low"], range=["#4caf50", "#f44336"]),
+                    legend=alt.Legend(orient="top")),
+                shape=alt.Shape("type:N",
+                    scale=alt.Scale(domain=["4h high", "4h low"], range=["triangle-up", "triangle-down"])),
+                tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Price:Q", format=".4f"), "type:N"],
             )
         )
         st.altair_chart(alt.layer(price_line, dots).properties(height=300), use_container_width=True)
@@ -249,71 +249,43 @@ def render_divergence(vd_rows, candle_rows, hours=24):
     return {"price_roc": price_roc, "cvd_total": cvd_total, "state": state}
 
 
-def detect_regimes(candle_rows, threshold_pct=1.0, min_duration_min=5):
-    """Segment price action into regimes (directional moves).
-    A new regime starts when price reverses >threshold_pct from local extreme."""
-    if len(candle_rows) < 2:
+def get_4h_buckets(candle_rows, bucket_seconds=4*3600):
+    """Split candle data into 4h buckets with OHLC and high/low timestamps."""
+    if not candle_rows:
         return []
 
-    regimes = []
-    regime_start_idx = 0
-    direction = None  # "up" or "down"
-    local_high = candle_rows[0][4]  # close price
-    local_low = candle_rows[0][4]
-    high_idx = 0
-    low_idx = 0
+    buckets = []
+    first_ts = candle_rows[0][0]
+    # Align to 4h boundary
+    bucket_start = (first_ts // bucket_seconds) * bucket_seconds
 
-    for i in range(1, len(candle_rows)):
-        price = candle_rows[i][4]
+    while bucket_start < candle_rows[-1][0]:
+        bucket_end = bucket_start + bucket_seconds
+        rows = [r for r in candle_rows if bucket_start <= r[0] < bucket_end]
+        if rows:
+            prices = [r[4] for r in rows]
+            high_val = max(prices)
+            low_val = min(prices)
+            high_idx = prices.index(high_val)
+            low_idx = prices.index(low_val)
+            buckets.append({
+                "start_ts": bucket_start,
+                "end_ts": bucket_end,
+                "open": rows[0][4],
+                "close": rows[-1][4],
+                "high": high_val,
+                "low": low_val,
+                "high_ts": rows[high_idx][0],
+                "low_ts": rows[low_idx][0],
+                "candles": rows,
+            })
+        bucket_start = bucket_end
 
-        if price > local_high:
-            local_high = price
-            high_idx = i
-        if price < local_low:
-            local_low = price
-            low_idx = i
-
-        # Check for reversal from high (was going up, now reversing down)
-        if local_high > 0:
-            drop_from_high = (local_high - price) / local_high * 100
-            if drop_from_high >= threshold_pct and direction != "down":
-                # End previous regime at the high point
-                if direction is not None:
-                    end_idx = high_idx
-                    duration_min = (candle_rows[end_idx][0] - candle_rows[regime_start_idx][0]) / 60
-                    if duration_min >= min_duration_min:
-                        regimes.append((regime_start_idx, end_idx, direction))
-                regime_start_idx = high_idx
-                direction = "down"
-                local_low = price
-                low_idx = i
-
-        # Check for reversal from low (was going down, now reversing up)
-        if local_low > 0:
-            rise_from_low = (price - local_low) / local_low * 100
-            if rise_from_low >= threshold_pct and direction != "up":
-                if direction is not None:
-                    end_idx = low_idx
-                    duration_min = (candle_rows[end_idx][0] - candle_rows[regime_start_idx][0]) / 60
-                    if duration_min >= min_duration_min:
-                        regimes.append((regime_start_idx, end_idx, direction))
-                regime_start_idx = low_idx
-                direction = "up"
-                local_high = price
-                high_idx = i
-
-    # Close the last regime
-    if direction is not None:
-        end_idx = len(candle_rows) - 1
-        duration_min = (candle_rows[end_idx][0] - candle_rows[regime_start_idx][0]) / 60
-        if duration_min >= min_duration_min:
-            regimes.append((regime_start_idx, end_idx, direction))
-
-    return regimes
+    return buckets
 
 
-def render_regime_analysis(candle_rows, stats_rows, hours=24):
-    """Show what changed in the book during each price regime."""
+def render_4h_analysis(candle_rows, stats_rows, hours=24):
+    """Show 4h buckets: price range + what changed in the book."""
     cutoff = int(time.time()) - hours * 3600
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
     stats_filtered = [r for r in stats_rows if r[0] >= cutoff]
@@ -321,26 +293,19 @@ def render_regime_analysis(candle_rows, stats_rows, hours=24):
     if len(candle_filtered) < 20 or len(stats_filtered) < 20:
         return
 
-    regimes = detect_regimes(candle_filtered)
-    if not regimes:
-        st.caption("No significant price moves detected in this window")
+    buckets = get_4h_buckets(candle_filtered)
+    if not buckets:
         return
 
     last_price = candle_filtered[-1][4]
     valid = valid_level_indices(last_price)
 
-    st.markdown("**Price regimes → book changes:**")
-
-    # Build stats lookup by timestamp for depth
-    stats_by_ts = {r[0]: r for r in stats_filtered}
-    stats_ts_list = [r[0] for r in stats_filtered]
+    st.markdown("**4h buckets → book changes:**")
 
     def get_depth_at(target_ts, window=15):
-        """Get 15-min smoothed depth around a timestamp."""
         start = target_ts - window * 60
         nearby = [r for r in stats_filtered if start <= r[0] <= target_ts]
         if not nearby:
-            # Fall back to closest available
             nearby = [r for r in stats_filtered if abs(r[0] - target_ts) < 30 * 60]
             if not nearby:
                 return None, None
@@ -355,53 +320,39 @@ def render_regime_analysis(candle_rows, stats_rows, hours=24):
                 ask_avg[j] += asks[j]
         return [v / n for v in bid_avg], [v / n for v in ask_avg]
 
-    # Build table — most recent regime first
-    header = "<tr><th>Period</th><th>Dur</th><th>Price</th>"
+    header = "<tr><th>Period</th><th>Open→Close</th><th>Range</th>"
     for i in valid:
         header += f"<th>Bid {DEPTH_LEVELS[i]}%</th><th>Ask {DEPTH_LEVELS[i]}%</th>"
     header += "<th>Net Vol</th><th>What happened</th></tr>"
 
     rows_html = ""
-    for start_idx, end_idx, direction in reversed(regimes):
-        start_ts = candle_filtered[start_idx][0]
-        end_ts = candle_filtered[end_idx][0]
-        start_price = candle_filtered[start_idx][4]
-        end_price = candle_filtered[end_idx][4]
-        price_chg = ((end_price - start_price) / start_price * 100) if start_price > 0 else 0
-        duration_min = (end_ts - start_ts) / 60
+    for b in reversed(buckets):
+        price_chg = ((b["close"] - b["open"]) / b["open"] * 100) if b["open"] > 0 else 0
+        price_range = ((b["high"] - b["low"]) / b["low"] * 100) if b["low"] > 0 else 0
 
-        # Depth at regime boundaries
-        bid_start, ask_start = get_depth_at(start_ts)
-        bid_end, ask_end = get_depth_at(end_ts)
+        bid_start, ask_start = get_depth_at(b["start_ts"])
+        bid_end, ask_end = get_depth_at(b["end_ts"])
 
         if bid_start is None or bid_end is None:
             continue
 
-        # Net volume during this regime
-        regime_stats = [r for r in stats_filtered if start_ts <= r[0] <= end_ts]
-        buy_vol = sum(r[5] for r in regime_stats)
-        sell_vol = sum(r[6] for r in regime_stats)
+        # Net volume
+        bucket_stats = [r for r in stats_filtered if b["start_ts"] <= r[0] < b["end_ts"]]
+        buy_vol = sum(r[5] for r in bucket_stats)
+        sell_vol = sum(r[6] for r in bucket_stats)
         net_vol = buy_vol - sell_vol
 
-        # Direction styling
-        dir_icon = "+" if direction == "up" else "-"
-        row_bg = "rgba(76,175,80,0.08)" if direction == "up" else "rgba(244,67,54,0.08)"
+        # Styling
+        row_bg = "rgba(76,175,80,0.06)" if price_chg >= 0 else "rgba(244,67,54,0.06)"
         price_color = "#4caf50" if price_chg >= 0 else "#f44336"
 
-        # Format duration
-        if duration_min >= 60:
-            dur_str = f"{duration_min / 60:.1f}h"
-        else:
-            dur_str = f"{duration_min:.0f}m"
-
-        time_str = f"{time.strftime('%m/%d %H:%M', time.gmtime(start_ts))}→{time.strftime('%H:%M', time.gmtime(end_ts))}"
+        time_str = time.strftime("%m/%d %H:%M", time.gmtime(b["start_ts"]))
 
         row = f'<tr style="background:{row_bg}">'
         row += f'<td style="text-align:left;white-space:nowrap">{time_str}</td>'
-        row += f'<td>{dur_str}</td>'
         row += f'<td style="color:{price_color};font-weight:bold">{price_chg:+.1f}%</td>'
+        row += f'<td>{price_range:.1f}%</td>'
 
-        # Per-level depth changes
         interp_parts = []
         for i in valid:
             bid_pct = ((bid_end[i] - bid_start[i]) / bid_start[i] * 100) if bid_start[i] > 0 else 0
@@ -411,8 +362,7 @@ def render_regime_analysis(candle_rows, stats_rows, hours=24):
             row += f'<td style="color:{bc}">{bid_pct:+.0f}%</td>'
             row += f'<td style="color:{ac}">{ask_pct:+.0f}%</td>'
 
-            # Build interpretation from most significant level
-            if i == valid[0]:  # Use tightest valid level for interpretation
+            if i == valid[0]:
                 if bid_pct < -10:
                     interp_parts.append("bids down")
                 elif bid_pct > 10:
@@ -425,26 +375,24 @@ def render_regime_analysis(candle_rows, stats_rows, hours=24):
         net_color = "#4caf50" if net_vol > 0 else "#f44336"
         row += f'<td style="color:{net_color}">${net_vol:+,.0f}</td>'
 
-        # Interpretation
         if not interp_parts:
             interp_text = "book stable"
         else:
             interp_text = ", ".join(interp_parts)
-            # Add context based on price direction + book changes
-            if direction == "down" and "bids down" in interp_parts:
+            if price_chg < -0.5 and "bids down" in interp_parts:
                 interp_text += " — bids absorbed/filled"
-            elif direction == "down" and "bids up" in interp_parts:
+            elif price_chg < -0.5 and "bids up" in interp_parts:
                 interp_text += " — buying the dip"
-            elif direction == "up" and "asks down" in interp_parts:
+            elif price_chg > 0.5 and "asks down" in interp_parts:
                 interp_text += " — asks lifted/filled"
-            elif direction == "up" and "asks up" in interp_parts:
+            elif price_chg > 0.5 and "asks up" in interp_parts:
                 interp_text += " — selling into strength"
 
-        row += f'<td style="text-align:left;font-size:11px">{interp_text}</td>'
+        row += f'<td style="text-align:left;font-size:12px">{interp_text}</td>'
         row += "</tr>"
         rows_html += row
 
-    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
+    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.4">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
     </table>"""
@@ -720,7 +668,7 @@ def main():
     # Divergence + book narrative
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
-    render_regime_analysis(candle_rows, stats_rows, hours=hours)
+    render_4h_analysis(candle_rows, stats_rows, hours=hours)
 
     # Depth events (fill/pull from WS)
     render_depth_events(conn, hours=hours)
