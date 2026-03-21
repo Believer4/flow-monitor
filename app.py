@@ -11,7 +11,7 @@ import time
 from config import EXCHANGE, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS
 from db import (
     get_conn, get_vd_history, get_stats_history, get_candle_history,
-    get_custom_depth_history, get_trades_history, get_trade_stats,
+    get_trades_history, get_trade_stats,
 )
 
 st.set_page_config(page_title="FLOW Monitor", layout="wide")
@@ -275,23 +275,7 @@ def smooth_depth_at_time(stats_rows, target_ts, window=SMOOTH_WINDOW):
     return [v / n for v in bid_avg], [v / n for v in ask_avg]
 
 
-def smooth_custom_depth(custom_rows, window=SMOOTH_WINDOW):
-    if not custom_rows:
-        return None, None
-    w = min(window, len(custom_rows))
-    recent = custom_rows[-w:]
-    return sum(r[2] for r in recent) / w, sum(r[3] for r in recent) / w
-
-
-def smooth_custom_depth_at_time(custom_rows, target_ts, window=SMOOTH_WINDOW):
-    start_ts = target_ts - window * 60
-    relevant = [r for r in custom_rows if start_ts <= r[0] <= target_ts]
-    if not relevant:
-        return None, None
-    return sum(r[2] for r in relevant) / len(relevant), sum(r[3] for r in relevant) / len(relevant)
-
-
-def render_depth_change_table(stats_rows, custom_depth_rows=None):
+def render_depth_change_table(stats_rows):
     if len(stats_rows) < 2:
         st.warning("Not enough stats data")
         return
@@ -301,23 +285,13 @@ def render_depth_change_table(stats_rows, custom_depth_rows=None):
     now_ts = stats_rows[-1][0]
     now_bids, now_asks = smooth_depth(stats_rows)
 
-    has_custom = custom_depth_rows and len(custom_depth_rows) >= 2
-    custom_bid_now, custom_ask_now = (None, None)
-    if has_custom:
-        custom_bid_now, custom_ask_now = smooth_custom_depth(custom_depth_rows)
-
     windows = [(60, "1h"), (240, "4h"), (720, "12h"), (1440, "24h")]
     refs = {}
-    custom_refs = {}
     for minutes, label in windows:
         target_ts = now_ts - minutes * 60
         bid_ref, ask_ref = smooth_depth_at_time(stats_rows, target_ts)
         if bid_ref is not None:
             refs[label] = (bid_ref, ask_ref)
-        if has_custom:
-            cb, ca = smooth_custom_depth_at_time(custom_depth_rows, target_ts)
-            if cb is not None:
-                custom_refs[label] = (cb, ca)
 
     header = "<tr><th>Level</th><th>Bid $</th><th>Ask $</th>"
     for _, label in windows:
@@ -342,25 +316,6 @@ def render_depth_change_table(stats_rows, custom_depth_rows=None):
             ac = "#4caf50" if ask_pct > 5 else "#f44336" if ask_pct < -5 else "#888"
             row += f'<td style="color:{bc}">{bid_pct:+.1f}%</td>'
             row += f'<td style="color:{ac}">{ask_pct:+.1f}%</td>'
-        row += "</tr>"
-        rows_html += row
-
-    if has_custom and custom_bid_now is not None:
-        row = f'<tr style="border-top:1px solid #444"><td>25% ★</td>'
-        row += f"<td>${custom_bid_now:,.0f}</td><td>${custom_ask_now:,.0f}</td>"
-        for _, label in windows:
-            if label not in refs:
-                continue
-            if label in custom_refs:
-                cb, ca = custom_refs[label]
-                bp = ((custom_bid_now - cb) / cb * 100) if cb > 0 else 0
-                ap = ((custom_ask_now - ca) / ca * 100) if ca > 0 else 0
-                bc = "#4caf50" if bp > 5 else "#f44336" if bp < -5 else "#888"
-                ac = "#4caf50" if ap > 5 else "#f44336" if ap < -5 else "#888"
-                row += f'<td style="color:{bc}">{bp:+.1f}%</td>'
-                row += f'<td style="color:{ac}">{ap:+.1f}%</td>'
-            else:
-                row += "<td>—</td><td>—</td>"
         row += "</tr>"
         rows_html += row
 
@@ -390,31 +345,6 @@ def render_depth_chart(stats_rows, level_idx, side, hours=24):
     st.line_chart(df, height=200)
 
 
-def render_custom_depth_chart(custom_rows, hours=24):
-    cutoff = int(time.time()) - hours * 3600
-    filtered = [r for r in custom_rows if r[0] >= cutoff]
-    if len(filtered) < SMOOTH_WINDOW:
-        st.info("Not enough custom depth data yet. Run collector.py to build 25% history.")
-        return
-
-    bid_smooth = smooth([r[2] for r in filtered], SMOOTH_WINDOW)
-    ask_smooth = smooth([r[3] for r in filtered], SMOOTH_WINDOW)
-    ts = [r[0] for r in filtered[SMOOTH_WINDOW - 1:]]
-
-    ts_ds, bid_ds = downsample(ts, bid_smooth)
-    _, ask_ds = downsample(ts, ask_smooth)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Bid depth @ 25% (15m avg)**")
-        df = pd.DataFrame({"Bid $": bid_ds}, index=[ts_to_label(t) for t in ts_ds])
-        st.line_chart(df, height=200)
-    with col2:
-        st.markdown("**Ask depth @ 25% (15m avg)**")
-        df = pd.DataFrame({"Ask $": ask_ds}, index=[ts_to_label(t) for t in ts_ds])
-        st.line_chart(df, height=200)
-
-
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -423,7 +353,6 @@ def main():
     vd_rows = get_vd_history(conn, EXCHANGE, SYMBOL)
     stats_rows = get_stats_history(conn, EXCHANGE, SYMBOL)
     candle_rows = get_candle_history(conn, EXCHANGE, SYMBOL)
-    custom_depth_rows = get_custom_depth_history(conn, EXCHANGE, SYMBOL)
 
     st.markdown("### FLOW/USD — Binance Spot")
 
@@ -452,7 +381,7 @@ def main():
 
     # ── 1. MARKET ACTIVITY ──
     st.markdown("## 1. Market Activity")
-    st.caption("Stacked view: Price → CVD (smoothed) → CVD Slope → Buy/Sell Volume")
+    st.caption("Price → CVD (net coins) → Buy/Sell Volume")
 
     render_market_activity(vd_rows, candle_rows, hours=hours)
 
@@ -475,24 +404,21 @@ def main():
     st.markdown("## 3. Limit Order Activity (Depth Changes)")
     st.caption("15-min smoothed averages. Green = depth increased >5%, Red = decreased >5%.")
 
-    render_depth_change_table(stats_rows, custom_depth_rows)
+    render_depth_change_table(stats_rows)
 
     valid = valid_level_indices(last_price)
-    level_options = [(i, f"{DEPTH_LEVELS[i]}%") for i in valid] + [(-1, "25% (custom)")]
     level_choice = st.selectbox(
         "Depth chart level",
-        [o[0] for o in level_options],
-        format_func=lambda i: dict(level_options)[i]
+        valid,
+        format_func=lambda i: f"{DEPTH_LEVELS[i]}%"
     )
 
-    if level_choice is not None and level_choice >= 0:
+    if level_choice is not None:
         col1, col2 = st.columns(2)
         with col1:
             render_depth_chart(stats_rows, level_choice, "bid", hours=hours)
         with col2:
             render_depth_chart(stats_rows, level_choice, "ask", hours=hours)
-    elif level_choice == -1:
-        render_custom_depth_chart(custom_depth_rows, hours=hours)
 
     # Auto-refresh
     st.divider()

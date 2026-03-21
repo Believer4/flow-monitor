@@ -6,7 +6,7 @@ import time
 import traceback
 from config import EXCHANGE, SYMBOL
 from mmt_client import MMTClient
-from db import get_conn, insert_vd, insert_stats, insert_candles, insert_custom_depth
+from db import get_conn, insert_vd, insert_stats, insert_candles
 
 POLL_INTERVAL = 60  # seconds
 
@@ -29,16 +29,6 @@ def collect_once(client, conn):
     candles_resp = client.get_candles(EXCHANGE, SYMBOL, tf="1m", from_ts=from_ts, to_ts=now)
     if candles_resp.get("data"):
         insert_candles(conn, EXCHANGE, SYMBOL, candles_resp["data"])
-
-    # Orderbook → custom 25% depth
-    ob = client.get_orderbook(EXCHANGE, SYMBOL)
-    if ob.get("lp"):
-        mid = ob["lp"]
-        low_25 = mid * 0.75
-        high_25 = mid * 1.25
-        bid_sum = sum(p * s for p, s in ob.get("b", []) if p >= low_25)
-        ask_sum = sum(p * s for p, s in ob.get("a", []) if p <= high_25)
-        insert_custom_depth(conn, EXCHANGE, SYMBOL, now, mid, bid_sum, ask_sum)
 
     return len(vd_resp.get("data", [])), len(stats_resp.get("data", []))
 
