@@ -36,7 +36,7 @@ WS_URL = f"wss://eu-central-1.mmt.gg/api/v1/ws?api_key={API_KEY}&format=json"
 
 # ── Trade tracking (per exchange) ──────────────────────────────────────────
 
-ZSCORE_LOOKBACK = 12 * 3600  # 12h
+ZSCORE_LOOKBACK = 1 * 3600  # 1h
 ZSCORE_THRESHOLD = 2.0
 TWAP_CHECK_INTERVAL = 300
 BUFFER_FLUSH_INTERVAL = 10
