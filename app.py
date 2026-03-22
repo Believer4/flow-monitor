@@ -328,18 +328,10 @@ def get_4h_buckets(candle_rows, bucket_seconds=4*3600):
     return buckets
 
 
-def render_cvd_depth_overlay(conn, vd_rows, hours=24):
-    """Overlay CVD + bid/ask depth on the same chart (dual Y-axis via layering)."""
+def render_aggregate_depth_chart(conn, hours=24):
+    """Separate bid/ask depth chart (aggregate across exchanges, 15m smoothed) — sits below CVD."""
     cutoff = int(time.time()) - hours * 3600
-    vd_filtered = [(t, v) for t, v in vd_rows if t >= cutoff]
 
-    if len(vd_filtered) < 30:
-        return
-
-    # CVD
-    ts_cvd, cvd_raw = compute_cvd(vd_filtered)
-
-    # Aggregate depth at 5% across all exchanges (smoothed per 15-min buckets)
     all_stats = {}
     for exch in ALL_EXCHANGES:
         rows = get_stats_history(conn, exch, SYMBOL, from_ts=cutoff)
@@ -349,11 +341,9 @@ def render_cvd_depth_overlay(conn, vd_rows, hours=24):
     if not all_stats:
         return
 
-    # Build aggregate depth time series at the tightest valid level
-    # Use 5% (index 5) as default — most meaningful for FLOW
     level_idx = 5  # 5.0%
 
-    # Collect all unique timestamps from stats
+    # Collect all unique timestamps
     all_ts = set()
     for rows in all_stats.values():
         for r in rows:
@@ -363,106 +353,75 @@ def render_cvd_depth_overlay(conn, vd_rows, hours=24):
     if len(all_ts) < 30:
         return
 
-    # For each timestamp, sum depth across exchanges
-    bid_series = []
-    ask_series = []
-    ts_depth = []
+    # Sum depth across exchanges per timestamp
+    bid_series, ask_series, ts_depth = [], [], []
     for ts in all_ts:
-        total_bid = 0.0
-        total_ask = 0.0
+        total_bid, total_ask = 0.0, 0.0
         found = False
         for exch, rows in all_stats.items():
-            # Find closest row within 90s
-            closest = None
             for r in rows:
                 if abs(r[0] - ts) <= 90:
-                    closest = r
+                    bids = json.loads(r[2])
+                    asks = json.loads(r[3])
+                    if level_idx < len(bids):
+                        total_bid += bids[level_idx]
+                        total_ask += asks[level_idx]
+                        found = True
                     break
-            if closest:
-                bids = json.loads(closest[2])
-                asks = json.loads(closest[3])
-                if level_idx < len(bids):
-                    total_bid += bids[level_idx]
-                    total_ask += asks[level_idx]
-                    found = True
         if found:
             ts_depth.append(ts)
             bid_series.append(total_bid)
             ask_series.append(total_ask)
 
-    # Smooth depth (15-min)
+    # Smooth
     if len(bid_series) > SMOOTH_WINDOW:
-        bid_smoothed = smooth(bid_series, SMOOTH_WINDOW)
-        ask_smoothed = smooth(ask_series, SMOOTH_WINDOW)
-        ts_depth_s = ts_depth[SMOOTH_WINDOW - 1:]
+        bid_sm = smooth(bid_series, SMOOTH_WINDOW)
+        ask_sm = smooth(ask_series, SMOOTH_WINDOW)
+        ts_sm = ts_depth[SMOOTH_WINDOW - 1:]
     else:
-        bid_smoothed = bid_series
-        ask_smoothed = ask_series
-        ts_depth_s = ts_depth
+        bid_sm, ask_sm, ts_sm = bid_series, ask_series, ts_depth
 
-    # Downsample both to same density
-    ts_cvd_ds, cvd_ds = downsample(ts_cvd, cvd_raw)
-    ts_bid_ds, bid_ds = downsample(ts_depth_s, bid_smoothed)
-    _, ask_ds = downsample(ts_depth_s, ask_smoothed)
+    ts_ds, bid_ds = downsample(ts_sm, bid_sm)
+    _, ask_ds = downsample(ts_sm, ask_sm)
 
-    st.markdown(f"**CVD vs Book Depth @ {DEPTH_LEVELS[level_idx]}% (all exchanges, 15m smoothed)**")
+    st.markdown(f"**Aggregate Book Depth @ {DEPTH_LEVELS[level_idx]}% (all exchanges, 15m smoothed)**")
 
-    # Build CVD line
-    df_cvd = pd.DataFrame({
-        "time": [ts_to_datetime(t) for t in ts_cvd_ds],
-        "CVD ($)": cvd_ds,
-    })
-    cvd_line = (
-        alt.Chart(df_cvd)
-        .mark_line(strokeWidth=2, color="#4fc3f7")
-        .encode(
-            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
-            y=alt.Y("CVD ($):Q", title="CVD ($)", axis=alt.Axis(titleColor="#4fc3f7")),
-            tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("CVD ($):Q", format=",.0f")],
-        )
-    )
-
-    # Build depth lines
-    df_depth = pd.DataFrame({
-        "time": [ts_to_datetime(t) for t in ts_bid_ds],
+    df = pd.DataFrame({
+        "time": [ts_to_datetime(t) for t in ts_ds],
         "Bid Depth": bid_ds,
         "Ask Depth": ask_ds,
     })
+
     bid_line = (
-        alt.Chart(df_depth)
-        .mark_line(strokeWidth=1.5, color="#4caf50", strokeDash=[4, 2])
+        alt.Chart(df).mark_line(strokeWidth=1.5, color="#4caf50")
         .encode(
-            x="time:T",
-            y=alt.Y("Bid Depth:Q", title="Depth ($)", axis=alt.Axis(titleColor="#4caf50")),
+            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+            y=alt.Y("Bid Depth:Q", scale=alt.Scale(zero=False), title="Depth ($)"),
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Bid Depth:Q", format=",.0f")],
         )
     )
     ask_line = (
-        alt.Chart(df_depth)
-        .mark_line(strokeWidth=1.5, color="#f44336", strokeDash=[4, 2])
+        alt.Chart(df).mark_line(strokeWidth=1.5, color="#f44336")
         .encode(
             x="time:T",
-            y=alt.Y("Ask Depth:Q"),
+            y=alt.Y("Ask Depth:Q", scale=alt.Scale(zero=False)),
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Ask Depth:Q", format=",.0f")],
         )
     )
 
-    # Layer: CVD on left axis, depth on right axis
-    combined = alt.layer(
-        cvd_line,
-        bid_line.encode(y=alt.Y("Bid Depth:Q", title="Depth ($)", axis=alt.Axis(titleColor="#4caf50"))),
-        ask_line,
-    ).resolve_scale(y="independent").properties(height=300)
-
-    st.altair_chart(combined, use_container_width=True)
-    st.caption("Solid blue = CVD | Dashed green = bid depth | Dashed red = ask depth")
+    chart = alt.layer(bid_line, ask_line).properties(height=250)
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("Green = bid depth | Red = ask depth")
 
 
 def render_depth_events_contextual(conn, candle_rows, hours=24):
-    """Show significant depth/price events: large depth changes (>20%) or large price moves (>5%)."""
+    """Show significant events: bid/ask depth ±50% in 1h, or price ±5% in 1h."""
     cutoff = int(time.time()) - hours * 3600
 
-    # Gather stats from all exchanges
+    DEPTH_THRESHOLD = 50  # % change in depth to trigger
+    PRICE_THRESHOLD = 5   # % change in price to trigger
+    WINDOW_SEC = 3600     # 1 hour
+
     all_stats = {}
     for exch in ALL_EXCHANGES:
         rows = get_stats_history(conn, exch, SYMBOL, from_ts=cutoff)
@@ -477,32 +436,29 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
     level_idx = 5  # 5.0%
     events = []
 
-    # Check every 30-min window for significant depth changes
-    window_sec = 30 * 60
+    # Slide 1h window in 15-min steps
     check_ts = cutoff
     now = int(time.time())
 
-    while check_ts < now - window_sec:
-        window_end = check_ts + window_sec
-
-        # Aggregate depth at start and end of window
-        def agg_depth_at(ts):
-            total_bid, total_ask = 0.0, 0.0
-            for exch, rows in all_stats.items():
-                nearby = [r for r in rows if abs(r[0] - ts) <= 120]
-                if nearby:
-                    r = nearby[0]
+    def agg_depth_at(ts):
+        total_bid, total_ask = 0.0, 0.0
+        for exch, rows in all_stats.items():
+            for r in rows:
+                if abs(r[0] - ts) <= 120:
                     bids = json.loads(r[2])
                     asks = json.loads(r[3])
                     if level_idx < len(bids):
                         total_bid += bids[level_idx]
                         total_ask += asks[level_idx]
-            return total_bid, total_ask
+                    break
+        return total_bid, total_ask
+
+    while check_ts < now - WINDOW_SEC:
+        window_end = check_ts + WINDOW_SEC
 
         bid_start, ask_start = agg_depth_at(check_ts)
         bid_end, ask_end = agg_depth_at(window_end)
 
-        # Price at boundaries
         prices_in_window = [r[4] for r in candle_filtered if check_ts <= r[0] < window_end]
 
         if bid_start > 0 and ask_start > 0 and prices_in_window:
@@ -512,38 +468,33 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
             price_end = prices_in_window[-1]
             price_chg = (price_end - price_start) / price_start * 100
 
-            # Flag if: depth changed >20% on either side, or price moved >3%
-            significant = abs(bid_chg) > 20 or abs(ask_chg) > 20 or abs(price_chg) > 3
+            # What triggered this event?
+            triggers = []
+            if abs(bid_chg) >= DEPTH_THRESHOLD:
+                triggers.append(f"bid depth {bid_chg:+.0f}% in 1h")
+            if abs(ask_chg) >= DEPTH_THRESHOLD:
+                triggers.append(f"ask depth {ask_chg:+.0f}% in 1h")
+            if abs(price_chg) >= PRICE_THRESHOLD:
+                triggers.append(f"price {price_chg:+.1f}% in 1h")
 
-            if significant:
-                # Build interpretation
-                parts = []
-                if bid_chg > 20:
-                    parts.append(f"bids +{bid_chg:.0f}%")
-                elif bid_chg < -20:
-                    parts.append(f"bids {bid_chg:.0f}%")
-                if ask_chg > 20:
-                    parts.append(f"asks +{ask_chg:.0f}%")
-                elif ask_chg < -20:
-                    parts.append(f"asks {ask_chg:.0f}%")
-
-                # Context
+            if triggers:
+                # Context interpretation
                 context = ""
-                if price_chg < -1 and bid_chg < -15:
+                if price_chg < -1 and bid_chg < -20:
                     context = "bids eaten on the way down"
-                elif price_chg < -1 and bid_chg > 15:
+                elif price_chg < -1 and bid_chg > 20:
                     context = "new bids placed — buying the dip"
-                elif price_chg > 1 and ask_chg < -15:
+                elif price_chg > 1 and ask_chg < -20:
                     context = "asks lifted — breakout buying"
-                elif price_chg > 1 and ask_chg > 15:
+                elif price_chg > 1 and ask_chg > 20:
                     context = "new asks placed — selling into strength"
-                elif abs(price_chg) < 1 and bid_chg < -20:
+                elif abs(price_chg) < 1 and bid_chg < -30:
                     context = "bids pulled without price move — spoofing?"
-                elif abs(price_chg) < 1 and ask_chg < -20:
+                elif abs(price_chg) < 1 and ask_chg < -30:
                     context = "asks pulled without price move — spoofing?"
-                elif abs(price_chg) < 1 and bid_chg > 20:
+                elif abs(price_chg) < 1 and bid_chg > 30:
                     context = "large bid wall added"
-                elif abs(price_chg) < 1 and ask_chg > 20:
+                elif abs(price_chg) < 1 and ask_chg > 30:
                     context = "large ask wall added"
 
                 events.append({
@@ -553,17 +504,18 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
                     "ask_chg": ask_chg,
                     "bid_usd": bid_end,
                     "ask_usd": ask_end,
-                    "parts": parts,
+                    "triggers": triggers,
                     "context": context,
                 })
 
-        check_ts += window_sec  # step by 30 min (non-overlapping)
+        check_ts += 15 * 60  # step 15 min
 
     if not events:
-        st.caption("No significant depth or price events in this window")
+        st.caption("No significant events (triggers: depth ±50% or price ±5% in 1h)")
         return
 
     st.markdown(f"**Significant events ({len(events)} detected):**")
+    st.caption(f"Triggers: bid/ask depth ±{DEPTH_THRESHOLD}% in 1h OR price ±{PRICE_THRESHOLD}% in 1h")
 
     rows_html = ""
     for e in reversed(events):
@@ -572,6 +524,7 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
         pc_color = "#4caf50" if pc > 0 else "#f44336" if pc < 0 else "#888"
         bc = "#4caf50" if e["bid_chg"] > 5 else "#f44336" if e["bid_chg"] < -5 else "#888"
         ac = "#4caf50" if e["ask_chg"] > 5 else "#f44336" if e["ask_chg"] < -5 else "#888"
+        trigger_str = " + ".join(e["triggers"])
 
         row = f'<tr>'
         row += f'<td style="text-align:left">{time_str}</td>'
@@ -580,11 +533,12 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
         row += f'<td>${e["bid_usd"]:,.0f}</td>'
         row += f'<td style="color:{ac}">{e["ask_chg"]:+.0f}%</td>'
         row += f'<td>${e["ask_usd"]:,.0f}</td>'
-        row += f'<td style="text-align:left">{e["context"]}</td>'
+        row += f'<td style="text-align:left;font-size:11px;color:#aaa">{trigger_str}</td>'
+        row += f'<td style="text-align:left;font-size:12px">{e["context"]}</td>'
         row += '</tr>'
         rows_html += row
 
-    header = "<tr><th>Time</th><th>Price</th><th>Bid Δ</th><th>Bid $</th><th>Ask Δ</th><th>Ask $</th><th>What happened</th></tr>"
+    header = "<tr><th>Time</th><th>Price</th><th>Bid Δ</th><th>Bid $</th><th>Ask Δ</th><th>Ask $</th><th>Trigger</th><th>What happened</th></tr>"
     html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
@@ -877,9 +831,8 @@ def main():
 
     render_market_activity(conn, vd_rows, candle_rows, hours=hours)
 
-    # CVD vs Depth overlay + divergence + contextual events
-    st.markdown("### CVD vs Book Depth")
-    render_cvd_depth_overlay(conn, vd_rows, hours=hours)
+    # Aggregate depth chart below CVD
+    render_aggregate_depth_chart(conn, hours=hours)
 
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
