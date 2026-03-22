@@ -1,6 +1,6 @@
 """
 Flow Monitor Dashboard
-Tracks market buying (CVD) and limit order activity (depth) for FLOW/USD on Binance spot.
+Tracks market buying (CVD) and limit order activity (depth) for FLOW/USD across all spot exchanges.
 """
 import streamlit as st
 import numpy as np
@@ -9,11 +9,14 @@ import altair as alt
 import json
 import time
 from datetime import datetime, timezone
-from config import EXCHANGE, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS
+from config import EXCHANGES, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS, PRIMARY_EXCHANGE, EXCHANGE
 from db import (
     get_conn, get_vd_history, get_stats_history, get_candle_history,
     get_trades_history, get_trade_stats, get_depth_events,
+    get_vd_history_multi, get_candle_history_multi, get_vd_by_exchange,
 )
+
+ALL_EXCHANGES = list(EXCHANGES.keys())
 
 st.set_page_config(page_title="FLOW Monitor", layout="wide")
 
@@ -99,8 +102,8 @@ def make_bar_chart(df, height=150):
     return alt.layer(buy_bars, sell_bars).properties(height=height)
 
 
-def render_market_activity(vd_rows, candle_rows, hours=24):
-    """Stacked: Price on top, raw CVD below, buy/sell volume bars at bottom."""
+def render_market_activity(conn, vd_rows, candle_rows, hours=24):
+    """Stacked: Price on top, aggregate CVD + per-exchange CVD, buy/sell volume bars."""
     cutoff = int(time.time()) - hours * 3600
     vd_filtered = [(t, v) for t, v in vd_rows if t >= cutoff]
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
@@ -127,8 +130,8 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
 
     # Metrics
     col1, col2 = st.columns(2)
-    col1.metric("CVD (coins)", f"{current_cvd_coins:+,.0f} FLOW")
-    col2.metric("CVD (USD)", f"${current_cvd_usd:+,.0f}")
+    col1.metric("Aggregate CVD (coins)", f"{current_cvd_coins:+,.0f} FLOW")
+    col2.metric("Aggregate CVD (USD)", f"${current_cvd_usd:+,.0f}")
 
     # Downsample
     ts_price_ds, prices_ds = downsample(ts_price, prices)
@@ -137,11 +140,9 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     buy_vols = [r[5] for r in candle_filtered]
     sell_vols = [r[6] for r in candle_filtered]
     ts_vol = [r[0] for r in candle_filtered]
-    ts_vol_ds, buy_ds = downsample(ts_vol, buy_vols)
-    _, sell_ds = downsample(ts_vol, sell_vols)
 
     # Price chart with 4h high/low markers
-    st.markdown("**Price**")
+    st.markdown("**Price (avg across exchanges)**")
     df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
     price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300)
 
@@ -176,15 +177,58 @@ def render_market_activity(vd_rows, candle_rows, hours=24):
     else:
         st.altair_chart(price_line, use_container_width=True)
 
-    # CVD chart
-    st.markdown("**CVD (net coins bought)**")
+    # Aggregate CVD chart
+    st.markdown("**Aggregate CVD (net coins bought — all exchanges)**")
     df_cvd = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_cvd_ds], "CVD": cvd_coins_ds})
-    # Color based on direction
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
     st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color, height=250), use_container_width=True)
 
-    # Volume bars — aggregate into hourly buckets so bars are visible
-    st.markdown("**Buy / Sell Volume ($) — hourly**")
+    # Per-exchange CVD breakdown
+    exch_colors = {"binance": "#F0B90B", "bybit": "#f7a600", "coinbase": "#0052FF", "okx": "#00C853"}
+    vd_by_exch = get_vd_by_exchange(conn, ALL_EXCHANGES, SYMBOL, from_ts=cutoff)
+
+    if len(vd_by_exch) > 1:
+        st.markdown("**CVD per exchange**")
+        dfs = []
+        for exch, rows in vd_by_exch.items():
+            ts_list, cvd_vals = compute_cvd(rows)
+            if ts_list:
+                ts_ds, cvd_ds = downsample(ts_list, cvd_vals)
+                df = pd.DataFrame({
+                    "time": [ts_to_datetime(t) for t in ts_ds],
+                    "CVD": cvd_ds,
+                    "Exchange": exch,
+                })
+                dfs.append(df)
+
+        if dfs:
+            df_all = pd.concat(dfs)
+            chart = (
+                alt.Chart(df_all)
+                .mark_line(strokeWidth=1.5)
+                .encode(
+                    x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+                    y=alt.Y("CVD:Q", title="CVD ($)"),
+                    color=alt.Color("Exchange:N",
+                        scale=alt.Scale(
+                            domain=list(exch_colors.keys()),
+                            range=list(exch_colors.values()))),
+                    tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"),
+                             alt.Tooltip("CVD:Q", format=",.0f"), "Exchange:N"],
+                )
+                .properties(height=250)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        # Per-exchange CVD metrics
+        cols = st.columns(len(vd_by_exch))
+        for i, (exch, rows) in enumerate(vd_by_exch.items()):
+            _, cvd_vals = compute_cvd(rows)
+            if cvd_vals:
+                cols[i].metric(f"{exch}", f"${cvd_vals[-1]:+,.0f}")
+
+    # Volume bars — aggregate into hourly buckets
+    st.markdown("**Buy / Sell Volume ($) — hourly (all exchanges)**")
     vol_df = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_vol], "Buy": buy_vols, "Sell": sell_vols})
     vol_df["hour"] = vol_df["time"].dt.floor("h")
     vol_hourly = vol_df.groupby("hour").agg({"Buy": "sum", "Sell": "sum"}).reset_index()
@@ -402,23 +446,32 @@ def render_4h_analysis(candle_rows, stats_rows, hours=24):
 # ── Trades Section ──────────────────────────────────────────────────────────
 
 def render_notable_trades(conn, hours=24):
-    """Show large trades (z-score > 2) as a feed."""
+    """Show large trades (z-score > 2) from all exchanges."""
     cutoff = int(time.time()) - hours * 3600
-    large_trades = get_trades_history(conn, EXCHANGE, SYMBOL, from_ts=cutoff, large_only=True)
 
-    if not large_trades:
+    # Gather from all exchanges
+    all_large = []
+    for exch in ALL_EXCHANGES:
+        trades = get_trades_history(conn, exch, SYMBOL, from_ts=cutoff, large_only=True)
+        for t in trades:
+            all_large.append((exch, *t))
+
+    if not all_large:
         st.info("No large trades detected yet. Start trades_collector.py to begin tracking.")
         return
 
-    # Build HTML table of notable trades (most recent first)
-    header = "<tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th><th>Z-Score</th></tr>"
+    # Sort by timestamp, most recent first
+    all_large.sort(key=lambda x: x[1], reverse=True)
+
+    header = "<tr><th>Time</th><th>Exchange</th><th>Side</th><th>Size</th><th>Price</th><th>Z-Score</th></tr>"
     rows_html = ""
-    for row in reversed(large_trades[-50:]):  # last 50
-        ts, price, size_usd, side, is_large, z_score = row
+    for row in all_large[:50]:
+        exch, ts, price, size_usd, side, is_large, z_score = row
         side_color = "#4caf50" if side == "buy" else "#f44336"
         rows_html += (
             f'<tr>'
             f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(ts))}</td>'
+            f'<td>{exch}</td>'
             f'<td style="color:{side_color};font-weight:bold">{side.upper()}</td>'
             f'<td>${size_usd:,.0f}</td>'
             f'<td>{price:.4f}</td>'
@@ -433,10 +486,10 @@ def render_notable_trades(conn, hours=24):
     st.markdown(html, unsafe_allow_html=True)
 
     # Summary stats
-    buy_large = [r for r in large_trades if r[3] == "buy"]
-    sell_large = [r for r in large_trades if r[3] == "sell"]
-    buy_vol = sum(r[2] for r in buy_large)
-    sell_vol = sum(r[2] for r in sell_large)
+    buy_large = [r for r in all_large if r[4] == "buy"]
+    sell_large = [r for r in all_large if r[4] == "sell"]
+    buy_vol = sum(r[3] for r in buy_large)
+    sell_vol = sum(r[3] for r in sell_large)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Large Buys", f"{len(buy_large)} (${buy_vol:,.0f})")
@@ -630,11 +683,20 @@ def render_depth_events(conn, hours=24):
 def main():
     conn = get_conn()
 
-    vd_rows = get_vd_history(conn, EXCHANGE, SYMBOL)
-    stats_rows = get_stats_history(conn, EXCHANGE, SYMBOL)
-    candle_rows = get_candle_history(conn, EXCHANGE, SYMBOL)
+    # Aggregate data across all exchanges
+    vd_rows = get_vd_history_multi(conn, ALL_EXCHANGES, SYMBOL)
+    candle_rows = get_candle_history_multi(conn, ALL_EXCHANGES, SYMBOL)
+    # Depth stats from primary exchange only (most liquid)
+    stats_rows = get_stats_history(conn, PRIMARY_EXCHANGE, SYMBOL)
 
-    st.markdown("### FLOW/USD — Binance Spot")
+    # Count how many exchanges have data
+    exch_with_data = []
+    for exch in ALL_EXCHANGES:
+        count = conn.execute("SELECT COUNT(*) FROM vd WHERE exchange=? AND symbol=?", (exch, SYMBOL)).fetchone()[0]
+        if count > 0:
+            exch_with_data.append(exch)
+
+    st.markdown(f"### FLOW/USD — Spot ({len(exch_with_data)} exchanges)")
 
     if not vd_rows or not stats_rows:
         st.error("No data yet. Run backfill.py first, then start collector.py.")
@@ -648,9 +710,9 @@ def main():
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Price", f"${last_price:.4f}")
-    col2.metric("Records", f"{total_records:,}")
-    col3.metric("Days", f"{days_of_data:.1f}")
-    col4.metric("Tick", f"{TICK_SIZE}")
+    col2.metric("Exchanges", f"{', '.join(exch_with_data)}")
+    col3.metric("Records", f"{total_records:,}")
+    col4.metric("Days", f"{days_of_data:.1f}")
 
     hours = st.selectbox(
         "Time window", [6, 12, 24, 48, 72, 168], index=2,
@@ -661,16 +723,16 @@ def main():
 
     # ── 1. MARKET ACTIVITY ──
     st.markdown("## 1. Market Activity")
-    st.caption("Price → CVD (net coins) → Buy/Sell Volume")
+    st.caption(f"Aggregate across {len(exch_with_data)} spot exchanges: {', '.join(exch_with_data)}")
 
-    render_market_activity(vd_rows, candle_rows, hours=hours)
+    render_market_activity(conn, vd_rows, candle_rows, hours=hours)
 
-    # Divergence + book narrative
+    # Divergence + book narrative (uses primary exchange for depth)
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
     render_4h_analysis(candle_rows, stats_rows, hours=hours)
 
-    # Depth events (fill/pull from WS)
+    # Depth events (fill/pull from WS — primary exchange only)
     render_depth_events(conn, hours=hours)
 
     st.divider()
@@ -685,8 +747,8 @@ def main():
     st.divider()
 
     # ── 3. LIMIT ORDER ACTIVITY ──
-    st.markdown("## 3. Limit Order Activity (Depth Changes)")
-    st.caption("15-min smoothed averages. Green = depth increased >5%, Red = decreased >5%.")
+    st.markdown(f"## 3. Limit Order Activity — {PRIMARY_EXCHANGE} (Depth Changes)")
+    st.caption(f"15-min smoothed averages from {PRIMARY_EXCHANGE} (most liquid). Green = depth increased >5%, Red = decreased >5%.")
 
     render_depth_change_table(stats_rows)
 

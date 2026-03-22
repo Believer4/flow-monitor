@@ -223,6 +223,18 @@ def get_vd_history(conn, exchange, symbol, from_ts=None):
     return conn.execute(q, params).fetchall()
 
 
+def get_vd_history_multi(conn, exchanges, symbol, from_ts=None):
+    """Get VD aggregated across multiple exchanges per timestamp."""
+    placeholders = ",".join("?" for _ in exchanges)
+    q = f"SELECT timestamp, SUM(close) FROM vd WHERE exchange IN ({placeholders}) AND symbol=? "
+    params = list(exchanges) + [symbol]
+    if from_ts:
+        q += "AND timestamp >= ? "
+        params.append(from_ts)
+    q += "GROUP BY timestamp ORDER BY timestamp"
+    return conn.execute(q, params).fetchall()
+
+
 def get_stats_history(conn, exchange, symbol, from_ts=None):
     q = "SELECT timestamp, last_price, bid_depth, ask_depth, skew, buy_vol, sell_vol FROM stats WHERE exchange=? AND symbol=? "
     params = [exchange, symbol]
@@ -241,6 +253,31 @@ def get_candle_history(conn, exchange, symbol, from_ts=None):
         params.append(from_ts)
     q += "ORDER BY timestamp"
     return conn.execute(q, params).fetchall()
+
+
+def get_candle_history_multi(conn, exchanges, symbol, from_ts=None):
+    """Get candle data aggregated across exchanges (volume summed, price averaged)."""
+    placeholders = ",".join("?" for _ in exchanges)
+    q = f"""SELECT timestamp,
+            AVG(open) as open, MAX(high) as high, MIN(low) as low, AVG(close) as close,
+            SUM(buy_vol) as buy_vol, SUM(sell_vol) as sell_vol
+            FROM candles WHERE exchange IN ({placeholders}) AND symbol=? """
+    params = list(exchanges) + [symbol]
+    if from_ts:
+        q += "AND timestamp >= ? "
+        params.append(from_ts)
+    q += "GROUP BY timestamp ORDER BY timestamp"
+    return conn.execute(q, params).fetchall()
+
+
+def get_vd_by_exchange(conn, exchanges, symbol, from_ts=None):
+    """Get VD per exchange (for breakdown chart)."""
+    result = {}
+    for exch in exchanges:
+        rows = get_vd_history(conn, exch, symbol, from_ts)
+        if rows:
+            result[exch] = rows
+    return result
 
 
 def get_record_count(conn, table, exchange, symbol):
