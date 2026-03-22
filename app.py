@@ -553,9 +553,8 @@ def smooth_depth_at_time(stats_rows, target_ts, window=SMOOTH_WINDOW):
     return [v / n for v in bid_avg], [v / n for v in ask_avg]
 
 
-def render_depth_change_table(stats_rows):
+def render_depth_change_table(stats_rows, label=None):
     if len(stats_rows) < 2:
-        st.warning("Not enough stats data")
         return
 
     last_price = stats_rows[-1][1]
@@ -565,16 +564,16 @@ def render_depth_change_table(stats_rows):
 
     windows = [(60, "1h"), (240, "4h"), (720, "12h"), (1440, "24h")]
     refs = {}
-    for minutes, label in windows:
+    for minutes, wlabel in windows:
         target_ts = now_ts - minutes * 60
         bid_ref, ask_ref = smooth_depth_at_time(stats_rows, target_ts)
         if bid_ref is not None:
-            refs[label] = (bid_ref, ask_ref)
+            refs[wlabel] = (bid_ref, ask_ref)
 
     header = "<tr><th>Level</th><th>Bid $</th><th>Ask $</th>"
-    for _, label in windows:
-        if label in refs:
-            header += f"<th>Bid Δ {label}</th><th>Ask Δ {label}</th>"
+    for _, wlabel in windows:
+        if wlabel in refs:
+            header += f"<th>Bid Δ {wlabel}</th><th>Ask Δ {wlabel}</th>"
     header += "</tr>"
 
     rows_html = ""
@@ -583,11 +582,11 @@ def render_depth_change_table(stats_rows):
         ask_now = now_asks[i]
         row = f"<tr><td>{DEPTH_LEVELS[i]}%</td>"
         row += f"<td>${bid_now:,.0f}</td><td>${ask_now:,.0f}</td>"
-        for _, label in windows:
-            if label not in refs:
+        for _, wlabel in windows:
+            if wlabel not in refs:
                 continue
-            bid_ref = refs[label][0][i]
-            ask_ref = refs[label][1][i]
+            bid_ref = refs[wlabel][0][i]
+            ask_ref = refs[wlabel][1][i]
             bid_pct = ((bid_now - bid_ref) / bid_ref * 100) if bid_ref > 0 else 0
             ask_pct = ((ask_now - ask_ref) / ask_ref * 100) if ask_ref > 0 else 0
             bc = "#4caf50" if bid_pct > 5 else "#f44336" if bid_pct < -5 else "#888"
@@ -597,6 +596,8 @@ def render_depth_change_table(stats_rows):
         row += "</tr>"
         rows_html += row
 
+    if label:
+        st.markdown(f"**{label}**")
     html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
     <thead style="border-bottom:1px solid #333">{header}</thead>
     <tbody>{rows_html}</tbody>
@@ -747,10 +748,59 @@ def main():
     st.divider()
 
     # ── 3. LIMIT ORDER ACTIVITY ──
-    st.markdown(f"## 3. Limit Order Activity — {PRIMARY_EXCHANGE} (Depth Changes)")
-    st.caption(f"15-min smoothed averages from {PRIMARY_EXCHANGE} (most liquid). Green = depth increased >5%, Red = decreased >5%.")
+    st.markdown("## 3. Limit Order Activity (Depth Changes)")
+    st.caption("15-min smoothed averages. Green = depth increased >5%, Red = decreased >5%.")
 
-    render_depth_change_table(stats_rows)
+    # Aggregate depth across all exchanges
+    all_stats = {}
+    for exch in ALL_EXCHANGES:
+        rows = get_stats_history(conn, exch, SYMBOL)
+        if len(rows) > 2:
+            all_stats[exch] = rows
+
+    if all_stats:
+        # Aggregate: sum depth across exchanges at each level
+        st.markdown("### Total (all exchanges)")
+        # Use the exchange with most data to build aggregate
+        # For aggregate, we sum the current depth from each exchange
+        agg_bid = [0.0] * 7
+        agg_ask = [0.0] * 7
+        for exch, rows in all_stats.items():
+            bids, asks = smooth_depth(rows)
+            for i in range(7):
+                agg_bid[i] += bids[i]
+                agg_ask[i] += asks[i]
+
+        valid = valid_level_indices(last_price)
+        # Show aggregate totals
+        header = "<tr><th>Level</th><th>Total Bid $</th><th>Total Ask $</th>"
+        for exch in all_stats:
+            header += f"<th>{exch} Bid</th><th>{exch} Ask</th>"
+        header += "</tr>"
+
+        rows_html = ""
+        for i in valid:
+            row = f"<tr><td>{DEPTH_LEVELS[i]}%</td>"
+            row += f'<td style="font-weight:bold">${agg_bid[i]:,.0f}</td>'
+            row += f'<td style="font-weight:bold">${agg_ask[i]:,.0f}</td>'
+            for exch, srows in all_stats.items():
+                bids, asks = smooth_depth(srows)
+                row += f"<td>${bids[i]:,.0f}</td><td>${asks[i]:,.0f}</td>"
+            row += "</tr>"
+            rows_html += row
+
+        html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.2">
+        <thead style="border-bottom:1px solid #333">{header}</thead>
+        <tbody>{rows_html}</tbody>
+        </table>"""
+        st.markdown(html, unsafe_allow_html=True)
+
+        # Per-exchange depth change tables
+        st.markdown("### Per-exchange depth changes")
+        for exch, rows in all_stats.items():
+            render_depth_change_table(rows, label=exch)
+    else:
+        render_depth_change_table(stats_rows, label=PRIMARY_EXCHANGE)
 
     valid = valid_level_indices(last_price)
     level_choice = st.selectbox(
