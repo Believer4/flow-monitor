@@ -100,8 +100,26 @@ local_bids = {}
 local_asks = {}
 book_initialized = False
 last_price = 0.0
-MIN_EVENT_USD = 500
+MIN_EVENT_USD = 100  # minimum to even consider (pre-filter)
 depth_event_buffer = []
+
+# Z-score for depth events — only log >2σ changes
+depth_change_history = []  # (ts, size_usd) for z-score
+
+
+def depth_z_score(value):
+    """Compute z-score for a depth change vs last 1h of changes."""
+    global depth_change_history
+    cutoff = time.time() - 3600
+    depth_change_history = [(ts, s) for ts, s in depth_change_history if ts >= cutoff]
+    if len(depth_change_history) < 20:
+        return 0.0
+    sizes = np.array([s for _, s in depth_change_history])
+    mean = sizes.mean()
+    std = sizes.std()
+    if std == 0:
+        return 0.0
+    return (value - mean) / std
 
 
 def was_price_traded(price, side, lookback_sec=10):
@@ -145,89 +163,56 @@ def process_depth_update(data):
 
     now = time.time()
 
-    for entry in data.get("b", []):
-        price, qty = entry[0], entry[1]
-        old_qty = local_bids.get(price, 0)
-        size_usd_change = abs(qty - old_qty) * price
+    def process_side(entries, book, side):
+        for entry in entries:
+            price, qty = entry[0], entry[1]
+            old_qty = book.get(price, 0)
+            size_usd_change = abs(qty - old_qty) * price
 
-        if size_usd_change >= MIN_EVENT_USD:
-            if qty == 0 and old_qty > 0:
-                filled = was_price_traded(price, "bid")
-                depth_event_buffer.append({
-                    "ts": now, "price": price, "side": "bid",
-                    "type": "filled" if filled else "pulled",
-                    "size_before": old_qty * price, "size_after": 0,
-                    "size_usd": old_qty * price, "filled": 1 if filled else 0,
-                })
-                tag = "FILLED" if filled else "PULLED"
-                print(f"  [{PRIMARY_EXCHANGE}] {tag} bid ${old_qty * price:,.0f} @ {price:.4f}")
-            elif qty > old_qty:
-                added_usd = (qty - old_qty) * price
-                if added_usd >= MIN_EVENT_USD:
-                    depth_event_buffer.append({
-                        "ts": now, "price": price, "side": "bid",
-                        "type": "added",
-                        "size_before": old_qty * price, "size_after": qty * price,
-                        "size_usd": added_usd, "filled": 0,
-                    })
-                    print(f"  [{PRIMARY_EXCHANGE}] NEW bid +${added_usd:,.0f} @ {price:.4f}")
-            elif qty < old_qty and qty > 0:
-                reduced_usd = (old_qty - qty) * price
-                if reduced_usd >= MIN_EVENT_USD:
-                    filled = was_price_traded(price, "bid")
-                    depth_event_buffer.append({
-                        "ts": now, "price": price, "side": "bid",
-                        "type": "partially_filled" if filled else "reduced",
-                        "size_before": old_qty * price, "size_after": qty * price,
-                        "size_usd": reduced_usd, "filled": 1 if filled else 0,
-                    })
+            # Track all changes >$100 for z-score reference distribution
+            if size_usd_change >= MIN_EVENT_USD:
+                depth_change_history.append((now, size_usd_change))
 
-        if qty == 0:
-            local_bids.pop(price, None)
-        else:
-            local_bids[price] = qty
+                # Only log events that are >2σ
+                z = depth_z_score(size_usd_change)
+                if z >= ZSCORE_THRESHOLD:
+                    if qty == 0 and old_qty > 0:
+                        filled = was_price_traded(price, side)
+                        event_type = "filled" if filled else "pulled"
+                        depth_event_buffer.append({
+                            "ts": now, "price": price, "side": side,
+                            "type": event_type,
+                            "size_before": old_qty * price, "size_after": 0,
+                            "size_usd": old_qty * price, "filled": 1 if filled else 0,
+                        })
+                        print(f"  [{PRIMARY_EXCHANGE}] {event_type.upper()} {side} ${old_qty * price:,.0f} @ {price:.4f} (z={z:.1f})")
+                    elif qty > old_qty:
+                        added_usd = (qty - old_qty) * price
+                        depth_event_buffer.append({
+                            "ts": now, "price": price, "side": side,
+                            "type": "added",
+                            "size_before": old_qty * price, "size_after": qty * price,
+                            "size_usd": added_usd, "filled": 0,
+                        })
+                        print(f"  [{PRIMARY_EXCHANGE}] NEW {side} +${added_usd:,.0f} @ {price:.4f} (z={z:.1f})")
+                    elif qty < old_qty and qty > 0:
+                        reduced_usd = (old_qty - qty) * price
+                        filled = was_price_traded(price, side)
+                        event_type = "partially_filled" if filled else "reduced"
+                        depth_event_buffer.append({
+                            "ts": now, "price": price, "side": side,
+                            "type": event_type,
+                            "size_before": old_qty * price, "size_after": qty * price,
+                            "size_usd": reduced_usd, "filled": 1 if filled else 0,
+                        })
 
-    for entry in data.get("a", []):
-        price, qty = entry[0], entry[1]
-        old_qty = local_asks.get(price, 0)
-        size_usd_change = abs(qty - old_qty) * price
+            if qty == 0:
+                book.pop(price, None)
+            else:
+                book[price] = qty
 
-        if size_usd_change >= MIN_EVENT_USD:
-            if qty == 0 and old_qty > 0:
-                filled = was_price_traded(price, "ask")
-                depth_event_buffer.append({
-                    "ts": now, "price": price, "side": "ask",
-                    "type": "filled" if filled else "pulled",
-                    "size_before": old_qty * price, "size_after": 0,
-                    "size_usd": old_qty * price, "filled": 1 if filled else 0,
-                })
-                tag = "FILLED" if filled else "PULLED"
-                print(f"  [{PRIMARY_EXCHANGE}] {tag} ask ${old_qty * price:,.0f} @ {price:.4f}")
-            elif qty > old_qty:
-                added_usd = (qty - old_qty) * price
-                if added_usd >= MIN_EVENT_USD:
-                    depth_event_buffer.append({
-                        "ts": now, "price": price, "side": "ask",
-                        "type": "added",
-                        "size_before": old_qty * price, "size_after": qty * price,
-                        "size_usd": added_usd, "filled": 0,
-                    })
-                    print(f"  [{PRIMARY_EXCHANGE}] NEW ask +${added_usd:,.0f} @ {price:.4f}")
-            elif qty < old_qty and qty > 0:
-                reduced_usd = (old_qty - qty) * price
-                if reduced_usd >= MIN_EVENT_USD:
-                    filled = was_price_traded(price, "ask")
-                    depth_event_buffer.append({
-                        "ts": now, "price": price, "side": "ask",
-                        "type": "partially_filled" if filled else "reduced",
-                        "size_before": old_qty * price, "size_after": qty * price,
-                        "size_usd": reduced_usd, "filled": 1 if filled else 0,
-                    })
-
-        if qty == 0:
-            local_asks.pop(price, None)
-        else:
-            local_asks[price] = qty
+    process_side(data.get("b", []), local_bids, "bid")
+    process_side(data.get("a", []), local_asks, "ask")
 
 
 # ── WS connection per exchange ─────────────────────────────────────────────

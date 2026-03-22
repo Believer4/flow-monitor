@@ -564,37 +564,55 @@ def render_significant_events(events):
 
 # ── Trades Section ──────────────────────────────────────────────────────────
 
-def render_notable_trades(conn, hours=24):
-    """Show large trades (z-score > 2) from all exchanges."""
+def render_notable_events(conn, hours=24):
+    """Show large trades + significant depth events (all >2σ)."""
     cutoff = int(time.time()) - hours * 3600
 
-    # Gather from all exchanges
-    all_large = []
+    # Gather large trades from all exchanges
+    all_events = []
     for exch in ALL_EXCHANGES:
         trades = get_trades_history(conn, exch, SYMBOL, from_ts=cutoff, large_only=True)
         for t in trades:
-            all_large.append((exch, *t))
+            ts, price, size_usd, side, is_large, z_score = t
+            all_events.append({
+                "ts": ts, "type": "trade", "exch": exch,
+                "side": side, "price": price, "size_usd": size_usd, "z_score": z_score,
+                "detail": f"{side.upper()} ${size_usd:,.0f}",
+            })
 
-    if not all_large:
-        st.info("No large trades detected yet. Start trades_collector.py to begin tracking.")
+    # Gather depth events (>2σ, from primary exchange)
+    depth_evts = get_depth_events(conn, EXCHANGE, SYMBOL, from_ts=cutoff, min_usd=0)
+    for row in depth_evts:
+        ts, price, side, event_type, size_before, size_after, size_usd, filled = row
+        all_events.append({
+            "ts": ts, "type": "depth", "exch": PRIMARY_EXCHANGE,
+            "side": side, "price": price, "size_usd": size_usd, "z_score": 0,
+            "detail": f"{event_type.upper()} {side} ${size_usd:,.0f}",
+        })
+
+    if not all_events:
+        st.info("No notable events yet. Start trades_collector.py to begin tracking.")
         return
 
     # Sort by timestamp, most recent first
-    all_large.sort(key=lambda x: x[1], reverse=True)
+    all_events.sort(key=lambda x: x["ts"], reverse=True)
 
-    header = "<tr><th>Time</th><th>Exchange</th><th>Side</th><th>Size</th><th>Price</th><th>Z-Score</th></tr>"
+    header = "<tr><th>Time</th><th>Source</th><th>Exchange</th><th>Side</th><th>Detail</th><th>Price</th><th>Size</th></tr>"
     rows_html = ""
-    for row in all_large[:50]:
-        exch, ts, price, size_usd, side, is_large, z_score = row
-        side_color = "#4caf50" if side == "buy" else "#f44336"
+    type_colors = {"trade": "#4fc3f7", "depth": "#ff9800"}
+    for e in all_events[:50]:
+        side_color = "#4caf50" if e["side"] == "buy" or e["side"] == "bid" else "#f44336"
+        tc = type_colors.get(e["type"], "#888")
+        label = "TRADE" if e["type"] == "trade" else "BOOK"
         rows_html += (
             f'<tr>'
-            f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(ts))}</td>'
-            f'<td>{exch}</td>'
-            f'<td style="color:{side_color};font-weight:bold">{side.upper()}</td>'
-            f'<td>${size_usd:,.0f}</td>'
-            f'<td>{price:.4f}</td>'
-            f'<td>{z_score:.1f}σ</td>'
+            f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(e["ts"]))}</td>'
+            f'<td style="color:{tc};font-weight:bold">{label}</td>'
+            f'<td>{e["exch"]}</td>'
+            f'<td style="color:{side_color};font-weight:bold">{e["side"].upper()}</td>'
+            f'<td style="text-align:left">{e["detail"]}</td>'
+            f'<td>{e["price"]:.4f}</td>'
+            f'<td>${e["size_usd"]:,.0f}</td>'
             f'</tr>'
         )
 
@@ -605,16 +623,19 @@ def render_notable_trades(conn, hours=24):
     st.markdown(html, unsafe_allow_html=True)
 
     # Summary stats
-    buy_large = [r for r in all_large if r[4] == "buy"]
-    sell_large = [r for r in all_large if r[4] == "sell"]
-    buy_vol = sum(r[3] for r in buy_large)
-    sell_vol = sum(r[3] for r in sell_large)
+    trade_events = [e for e in all_events if e["type"] == "trade"]
+    depth_events_list = [e for e in all_events if e["type"] == "depth"]
+    buy_large = [e for e in trade_events if e["side"] == "buy"]
+    sell_large = [e for e in trade_events if e["side"] == "sell"]
+    buy_vol = sum(e["size_usd"] for e in buy_large)
+    sell_vol = sum(e["size_usd"] for e in sell_large)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Large Buys", f"{len(buy_large)} (${buy_vol:,.0f})")
     col2.metric("Large Sells", f"{len(sell_large)} (${sell_vol:,.0f})")
     net = buy_vol - sell_vol
     col3.metric("Net Large", f"${net:+,.0f}")
+    col4.metric("Book Events", f"{len(depth_events_list)}")
 
 
 def render_trade_intensity(conn, hours=24):
@@ -854,16 +875,13 @@ def main():
     render_divergence(vd_rows, candle_rows, hours=hours)
     render_significant_events(sig_events)
 
-    # Depth events (fill/pull from WS — primary exchange only)
-    render_depth_events(conn, hours=hours)
-
     st.divider()
 
-    # ── 2. NOTABLE TRADES ──
-    st.markdown("## 2. Notable Trades (z-score > 2σ)")
-    st.caption("Trades >2σ vs last 1h of trades. WebSocket only — does not backfill when offline.")
+    # ── 2. NOTABLE TRADES + DEPTH EVENTS ──
+    st.markdown("## 2. Notable Events (z-score > 2σ)")
+    st.caption("Large trades + significant order book changes. All >2σ vs last 1h. WebSocket only — does not backfill.")
 
-    render_notable_trades(conn, hours=hours)
+    render_notable_events(conn, hours=hours)
     render_trade_intensity(conn, hours=hours)
 
     st.divider()
