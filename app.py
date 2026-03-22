@@ -102,8 +102,8 @@ def make_bar_chart(df, height=150):
     return alt.layer(buy_bars, sell_bars).properties(height=height)
 
 
-def render_market_activity(conn, vd_rows, candle_rows, hours=24):
-    """Stacked: Price on top, aggregate CVD + per-exchange CVD, buy/sell volume bars."""
+def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None):
+    """Stacked: Price → CVD → Depth → per-exchange CVD → volume bars."""
     cutoff = int(time.time()) - hours * 3600
     vd_filtered = [(t, v) for t, v in vd_rows if t >= cutoff]
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
@@ -141,39 +141,41 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24):
     sell_vols = [r[6] for r in candle_filtered]
     ts_vol = [r[0] for r in candle_filtered]
 
-    # Price chart with 4h high/low markers
+    # Price chart with significant event markers
     st.markdown("**Price (avg across exchanges)**")
     df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
     price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300)
 
-    # Compute 4h high/low points
-    buckets_4h = get_4h_buckets(candle_filtered)
-    if buckets_4h:
-        hl_times, hl_prices, hl_types = [], [], []
-        for b in buckets_4h:
-            hl_times.append(ts_to_datetime(b["high_ts"]))
-            hl_prices.append(b["high"])
-            hl_types.append("4h high")
-            hl_times.append(ts_to_datetime(b["low_ts"]))
-            hl_prices.append(b["low"])
-            hl_types.append("4h low")
+    if sig_events:
+        evt_times, evt_prices, evt_labels = [], [], []
+        for e in sig_events:
+            # Find closest price to event timestamp
+            closest_price = None
+            for i, ts in enumerate(ts_price):
+                if abs(ts - e["ts"]) < 120:
+                    closest_price = prices[i]
+                    break
+            if closest_price:
+                evt_times.append(ts_to_datetime(e["ts"]))
+                evt_prices.append(closest_price)
+                evt_labels.append(e["triggers"][0] if e["triggers"] else "event")
 
-        df_hl = pd.DataFrame({"time": hl_times, "Price": hl_prices, "type": hl_types})
-        dots = (
-            alt.Chart(df_hl)
-            .mark_point(size=80, filled=True)
-            .encode(
-                x="time:T",
-                y=alt.Y("Price:Q", scale=alt.Scale(zero=False)),
-                color=alt.Color("type:N",
-                    scale=alt.Scale(domain=["4h high", "4h low"], range=["#4caf50", "#f44336"]),
-                    legend=alt.Legend(orient="top")),
-                shape=alt.Shape("type:N",
-                    scale=alt.Scale(domain=["4h high", "4h low"], range=["triangle-up", "triangle-down"])),
-                tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Price:Q", format=".4f"), "type:N"],
+        if evt_times:
+            df_evt = pd.DataFrame({"time": evt_times, "Price": evt_prices, "event": evt_labels})
+            dots = (
+                alt.Chart(df_evt)
+                .mark_point(size=100, filled=True, color="#ff9800")
+                .encode(
+                    x="time:T",
+                    y=alt.Y("Price:Q", scale=alt.Scale(zero=False)),
+                    tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"),
+                             alt.Tooltip("Price:Q", format=".4f"),
+                             alt.Tooltip("event:N", title="Trigger")],
+                )
             )
-        )
-        st.altair_chart(alt.layer(price_line, dots).properties(height=300), use_container_width=True)
+            st.altair_chart(alt.layer(price_line, dots).properties(height=300), use_container_width=True)
+        else:
+            st.altair_chart(price_line, use_container_width=True)
     else:
         st.altair_chart(price_line, use_container_width=True)
 
@@ -182,6 +184,9 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24):
     df_cvd = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_cvd_ds], "CVD": cvd_coins_ds})
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
     st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color, height=250), use_container_width=True)
+
+    # Aggregate depth chart (3rd from top)
+    render_aggregate_depth_chart(conn, hours=hours)
 
     # Per-exchange CVD breakdown
     exch_colors = {"binance": "#F0B90B", "bybit": "#f7a600", "coinbase": "#0052FF", "okx": "#00C853"}
@@ -353,11 +358,15 @@ def render_aggregate_depth_chart(conn, hours=24):
     if len(all_ts) < 30:
         return
 
-    # Sum depth across exchanges per timestamp
+    # Sum depth across exchanges per timestamp, normalize by exchange count
+    # to prevent crash when some exchanges stop having data
     bid_series, ask_series, ts_depth = [], [], []
+    # Track how many exchanges have data at the most recent timestamp to set baseline
+    max_exchanges = len(all_stats)
+
     for ts in all_ts:
         total_bid, total_ask = 0.0, 0.0
-        found = False
+        exch_count = 0
         for exch, rows in all_stats.items():
             for r in rows:
                 if abs(r[0] - ts) <= 90:
@@ -366,12 +375,14 @@ def render_aggregate_depth_chart(conn, hours=24):
                     if level_idx < len(bids):
                         total_bid += bids[level_idx]
                         total_ask += asks[level_idx]
-                        found = True
+                        exch_count += 1
                     break
-        if found:
+        if exch_count > 0:
+            # Scale up to full exchange count so chart doesn't drop when some go offline
+            scale = max_exchanges / exch_count
             ts_depth.append(ts)
-            bid_series.append(total_bid)
-            ask_series.append(total_ask)
+            bid_series.append(total_bid * scale)
+            ask_series.append(total_ask * scale)
 
     # Smooth
     if len(bid_series) > SMOOTH_WINDOW:
@@ -414,13 +425,13 @@ def render_aggregate_depth_chart(conn, hours=24):
     st.caption("Green = bid depth | Red = ask depth")
 
 
-def render_depth_events_contextual(conn, candle_rows, hours=24):
-    """Show significant events: bid/ask depth ±50% in 1h, or price ±5% in 1h."""
+def compute_significant_events(conn, candle_rows, hours=24):
+    """Compute significant events: bid/ask depth ±50% in 1h, or price ±5% in 1h. Returns list of events."""
     cutoff = int(time.time()) - hours * 3600
 
-    DEPTH_THRESHOLD = 50  # % change in depth to trigger
-    PRICE_THRESHOLD = 5   # % change in price to trigger
-    WINDOW_SEC = 3600     # 1 hour
+    DEPTH_THRESHOLD = 50
+    PRICE_THRESHOLD = 5
+    WINDOW_SEC = 3600
 
     all_stats = {}
     for exch in ALL_EXCHANGES:
@@ -510,12 +521,17 @@ def render_depth_events_contextual(conn, candle_rows, hours=24):
 
         check_ts += 15 * 60  # step 15 min
 
+    return events
+
+
+def render_significant_events(events):
+    """Render the significant events table."""
     if not events:
         st.caption("No significant events (triggers: depth ±50% or price ±5% in 1h)")
         return
 
     st.markdown(f"**Significant events ({len(events)} detected):**")
-    st.caption(f"Triggers: bid/ask depth ±{DEPTH_THRESHOLD}% in 1h OR price ±{PRICE_THRESHOLD}% in 1h")
+    st.caption("Triggers: bid/ask depth ±50% in 1h OR price ±5% in 1h")
 
     rows_html = ""
     for e in reversed(events):
@@ -829,14 +845,14 @@ def main():
     st.markdown("## 1. Market Activity")
     st.caption(f"Aggregate across {len(exch_with_data)} spot exchanges: {', '.join(exch_with_data)}")
 
-    render_market_activity(conn, vd_rows, candle_rows, hours=hours)
+    # Compute significant events first so price chart can show markers
+    sig_events = compute_significant_events(conn, candle_rows, hours=hours)
 
-    # Aggregate depth chart below CVD
-    render_aggregate_depth_chart(conn, hours=hours)
+    render_market_activity(conn, vd_rows, candle_rows, hours=hours, sig_events=sig_events)
 
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
-    render_depth_events_contextual(conn, candle_rows, hours=hours)
+    render_significant_events(sig_events)
 
     # Depth events (fill/pull from WS — primary exchange only)
     render_depth_events(conn, hours=hours)
@@ -855,6 +871,18 @@ def main():
     # ── 3. LIMIT ORDER ACTIVITY ──
     st.markdown("## 3. Limit Order Activity (Depth Changes)")
     st.caption("15-min smoothed averages. Green = depth increased >5%, Red = decreased >5%.")
+
+    # Show last reading per exchange
+    now_ts = int(time.time())
+    last_parts = []
+    for exch in ALL_EXCHANGES:
+        row = conn.execute("SELECT MAX(timestamp) FROM stats WHERE exchange=? AND symbol=?", (exch, SYMBOL)).fetchone()
+        if row[0]:
+            age_min = (now_ts - row[0]) / 60
+            color = "#4caf50" if age_min < 5 else "#ff9800" if age_min < 60 else "#f44336"
+            last_parts.append(f'<span style="color:{color}">{exch}: {age_min:.0f}m ago</span>')
+    if last_parts:
+        st.markdown("Last reading: " + " | ".join(last_parts), unsafe_allow_html=True)
 
     # Aggregate depth across all exchanges
     all_stats = {}
