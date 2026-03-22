@@ -442,7 +442,7 @@ def compute_significant_events(conn, candle_rows, hours=24):
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
 
     if not all_stats or len(candle_filtered) < 30:
-        return
+        return []
 
     level_idx = 5  # 5.0%
     events = []
