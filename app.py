@@ -328,13 +328,19 @@ def get_4h_buckets(candle_rows, bucket_seconds=4*3600):
     return buckets
 
 
-def render_4h_analysis(candle_rows, stats_rows, hours=24):
-    """Show 4h buckets: price range + what changed in the book."""
+def render_4h_analysis(conn, candle_rows, hours=24):
+    """Show 4h buckets: price range + what changed in the book (aggregate across all exchanges)."""
     cutoff = int(time.time()) - hours * 3600
     candle_filtered = [r for r in candle_rows if r[0] >= cutoff]
-    stats_filtered = [r for r in stats_rows if r[0] >= cutoff]
 
-    if len(candle_filtered) < 20 or len(stats_filtered) < 20:
+    # Gather stats from all exchanges
+    all_stats_filtered = {}
+    for exch in ALL_EXCHANGES:
+        rows = get_stats_history(conn, exch, SYMBOL, from_ts=cutoff)
+        if rows:
+            all_stats_filtered[exch] = rows
+
+    if len(candle_filtered) < 20 or not all_stats_filtered:
         return
 
     buckets = get_4h_buckets(candle_filtered)
@@ -344,25 +350,36 @@ def render_4h_analysis(candle_rows, stats_rows, hours=24):
     last_price = candle_filtered[-1][4]
     valid = valid_level_indices(last_price)
 
-    st.markdown("**4h buckets → book changes:**")
+    st.markdown(f"**4h buckets → book changes (aggregate, {len(all_stats_filtered)} exchanges):**")
 
-    def get_depth_at(target_ts, window=15):
+    def get_depth_at_aggregate(target_ts, window=15):
+        """Get 15-min smoothed depth summed across all exchanges."""
         start = target_ts - window * 60
-        nearby = [r for r in stats_filtered if start <= r[0] <= target_ts]
-        if not nearby:
-            nearby = [r for r in stats_filtered if abs(r[0] - target_ts) < 30 * 60]
+        total_bid = [0.0] * 7
+        total_ask = [0.0] * 7
+        any_data = False
+        for exch, stats_rows in all_stats_filtered.items():
+            nearby = [r for r in stats_rows if start <= r[0] <= target_ts]
             if not nearby:
-                return None, None
-        n = len(nearby)
-        bid_avg = [0.0] * 7
-        ask_avg = [0.0] * 7
-        for row in nearby:
-            bids = json.loads(row[2])
-            asks = json.loads(row[3])
-            for j in range(min(7, len(bids))):
-                bid_avg[j] += bids[j]
-                ask_avg[j] += asks[j]
-        return [v / n for v in bid_avg], [v / n for v in ask_avg]
+                nearby = [r for r in stats_rows if abs(r[0] - target_ts) < 30 * 60]
+            if not nearby:
+                continue
+            any_data = True
+            n = len(nearby)
+            for row in nearby:
+                bids = json.loads(row[2])
+                asks = json.loads(row[3])
+                for j in range(min(7, len(bids))):
+                    total_bid[j] += bids[j] / n
+                    total_ask[j] += asks[j] / n
+        if not any_data:
+            return None, None
+        return total_bid, total_ask
+
+    # Also aggregate buy/sell volume across all exchanges for net vol
+    all_stats_flat = []
+    for rows in all_stats_filtered.values():
+        all_stats_flat.extend(rows)
 
     header = "<tr><th>Period</th><th>Open→Close</th><th>Range</th>"
     for i in valid:
@@ -374,14 +391,14 @@ def render_4h_analysis(candle_rows, stats_rows, hours=24):
         price_chg = ((b["close"] - b["open"]) / b["open"] * 100) if b["open"] > 0 else 0
         price_range = ((b["high"] - b["low"]) / b["low"] * 100) if b["low"] > 0 else 0
 
-        bid_start, ask_start = get_depth_at(b["start_ts"])
-        bid_end, ask_end = get_depth_at(b["end_ts"])
+        bid_start, ask_start = get_depth_at_aggregate(b["start_ts"])
+        bid_end, ask_end = get_depth_at_aggregate(b["end_ts"])
 
         if bid_start is None or bid_end is None:
             continue
 
-        # Net volume
-        bucket_stats = [r for r in stats_filtered if b["start_ts"] <= r[0] < b["end_ts"]]
+        # Net volume across all exchanges
+        bucket_stats = [r for r in all_stats_flat if b["start_ts"] <= r[0] < b["end_ts"]]
         buy_vol = sum(r[5] for r in bucket_stats)
         sell_vol = sum(r[6] for r in bucket_stats)
         net_vol = buy_vol - sell_vol
@@ -634,7 +651,7 @@ def render_depth_events(conn, hours=24):
     events = get_depth_events(conn, EXCHANGE, SYMBOL, from_ts=cutoff, min_usd=500)
 
     if not events:
-        st.caption("No depth events yet. Start trades_collector.py for live order book tracking.")
+        st.caption("No depth events yet. Start trades_collector.py for live tracking. WebSocket only — does not backfill.")
         return
 
     st.markdown("**Order Book Events (live)**")
@@ -731,7 +748,7 @@ def main():
     # Divergence + book narrative (uses primary exchange for depth)
     st.markdown("### CVD vs Price Divergence")
     render_divergence(vd_rows, candle_rows, hours=hours)
-    render_4h_analysis(candle_rows, stats_rows, hours=hours)
+    render_4h_analysis(conn, candle_rows, hours=hours)
 
     # Depth events (fill/pull from WS — primary exchange only)
     render_depth_events(conn, hours=hours)
@@ -740,7 +757,7 @@ def main():
 
     # ── 2. NOTABLE TRADES ──
     st.markdown("## 2. Notable Trades (z-score > 2σ)")
-    st.caption("Trades >2σ vs last 12h of trades. Detected via WebSocket. Includes TWAP pattern detection.")
+    st.caption("Trades >2σ vs last 1h of trades. WebSocket only — does not backfill when offline.")
 
     render_notable_trades(conn, hours=hours)
     render_trade_intensity(conn, hours=hours)
