@@ -8,11 +8,13 @@ import pandas as pd
 import altair as alt
 import json
 import time
+import subprocess
+import signal
+import os
 from datetime import datetime, timezone
 from config import EXCHANGES, SYMBOL, TICK_SIZE, DEPTH_LEVELS, HISTORY_DAYS, PRIMARY_EXCHANGE, EXCHANGE
 from db import (
     get_conn, get_vd_history, get_stats_history, get_candle_history,
-    get_trades_history, get_trade_stats, get_depth_events,
     get_vd_history_multi, get_candle_history_multi, get_vd_by_exchange,
 )
 
@@ -70,14 +72,21 @@ def ts_to_datetime(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False):
+def make_x_scale(x_domain=None):
+    """Shared x-axis scale — forces all charts to the same time range."""
+    if x_domain:
+        return alt.Scale(domain=x_domain)
+    return alt.Scale()
+
+
+def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False, x_domain=None):
     """Create an Altair line chart with proper axis scaling."""
     y_scale = alt.Scale(zero=y_zero)
     chart = (
         alt.Chart(df)
         .mark_line(strokeWidth=1.5, color=color)
         .encode(
-            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+            x=alt.X("time:T", scale=make_x_scale(x_domain), axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
             y=alt.Y(f"{y_col}:Q", scale=y_scale, title=y_col),
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip(f"{y_col}:Q", format=",.2f")],
         )
@@ -86,10 +95,10 @@ def make_chart(df, y_col, color="#4fc3f7", height=200, y_zero=False):
     return chart
 
 
-def make_bar_chart(df, height=150):
+def make_bar_chart(df, height=150, x_domain=None):
     """Buy/sell volume bar chart — layered approach for Altair 6 compatibility."""
     base = alt.Chart(df).encode(
-        x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+        x=alt.X("time:T", scale=make_x_scale(x_domain), axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
     )
     buy_bars = base.mark_bar(color="#4caf50", opacity=0.7).encode(
         y=alt.Y("Buy:Q", title="Volume ($)"),
@@ -141,10 +150,13 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None
     sell_vols = [r[6] for r in candle_filtered]
     ts_vol = [r[0] for r in candle_filtered]
 
+    # Shared x-axis domain for all charts — use pandas Timestamps for Altair compatibility
+    x_domain = [pd.Timestamp(ts_to_datetime(cutoff)), pd.Timestamp(ts_to_datetime(int(time.time())))]
+
     # Price chart with significant event markers
     st.markdown("**Price (avg across exchanges)**")
     df_price = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_price_ds], "Price": prices_ds})
-    price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300)
+    price_line = make_chart(df_price, "Price", color="#4fc3f7", height=300, x_domain=x_domain)
 
     if sig_events:
         evt_times, evt_prices, evt_labels = [], [], []
@@ -166,7 +178,7 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None
                 alt.Chart(df_evt)
                 .mark_point(size=100, filled=True, color="#ff9800")
                 .encode(
-                    x="time:T",
+                    x=alt.X("time:T", scale=make_x_scale(x_domain)),
                     y=alt.Y("Price:Q", scale=alt.Scale(zero=False)),
                     tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"),
                              alt.Tooltip("Price:Q", format=".4f"),
@@ -183,10 +195,10 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None
     st.markdown("**Aggregate CVD (net coins bought — all exchanges)**")
     df_cvd = pd.DataFrame({"time": [ts_to_datetime(t) for t in ts_cvd_ds], "CVD": cvd_coins_ds})
     cvd_color = "#4caf50" if current_cvd_coins >= 0 else "#f44336"
-    st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color, height=250), use_container_width=True)
+    st.altair_chart(make_chart(df_cvd, "CVD", color=cvd_color, height=250, x_domain=x_domain), use_container_width=True)
 
     # Aggregate depth chart (3rd from top)
-    render_aggregate_depth_chart(conn, hours=hours)
+    render_aggregate_depth_chart(conn, hours=hours, x_domain=x_domain)
 
     # Per-exchange CVD breakdown
     exch_colors = {"binance": "#F0B90B", "bybit": "#f7a600", "coinbase": "#0052FF", "okx": "#00C853"}
@@ -212,12 +224,13 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None
                 alt.Chart(df_all)
                 .mark_line(strokeWidth=1.5)
                 .encode(
-                    x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+                    x=alt.X("time:T", scale=make_x_scale(x_domain), axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
                     y=alt.Y("CVD:Q", title="CVD ($)"),
                     color=alt.Color("Exchange:N",
                         scale=alt.Scale(
                             domain=list(exch_colors.keys()),
-                            range=list(exch_colors.values()))),
+                            range=list(exch_colors.values())),
+                        legend=alt.Legend(orient="bottom", direction="horizontal")),
                     tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"),
                              alt.Tooltip("CVD:Q", format=",.0f"), "Exchange:N"],
                 )
@@ -238,7 +251,7 @@ def render_market_activity(conn, vd_rows, candle_rows, hours=24, sig_events=None
     vol_df["hour"] = vol_df["time"].dt.floor("h")
     vol_hourly = vol_df.groupby("hour").agg({"Buy": "sum", "Sell": "sum"}).reset_index()
     vol_hourly.rename(columns={"hour": "time"}, inplace=True)
-    st.altair_chart(make_bar_chart(vol_hourly), use_container_width=True)
+    st.altair_chart(make_bar_chart(vol_hourly, x_domain=x_domain), use_container_width=True)
 
 
 def render_divergence(vd_rows, candle_rows, hours=24):
@@ -298,42 +311,39 @@ def render_divergence(vd_rows, candle_rows, hours=24):
     return {"price_roc": price_roc, "cvd_total": cvd_total, "state": state}
 
 
-def get_4h_buckets(candle_rows, bucket_seconds=4*3600):
-    """Split candle data into 4h buckets with OHLC and high/low timestamps."""
-    if not candle_rows:
-        return []
 
-    buckets = []
-    first_ts = candle_rows[0][0]
-    # Align to 4h boundary
-    bucket_start = (first_ts // bucket_seconds) * bucket_seconds
-
-    while bucket_start < candle_rows[-1][0]:
-        bucket_end = bucket_start + bucket_seconds
-        rows = [r for r in candle_rows if bucket_start <= r[0] < bucket_end]
-        if rows:
-            prices = [r[4] for r in rows]
-            high_val = max(prices)
-            low_val = min(prices)
-            high_idx = prices.index(high_val)
-            low_idx = prices.index(low_val)
-            buckets.append({
-                "start_ts": bucket_start,
-                "end_ts": bucket_end,
-                "open": rows[0][4],
-                "close": rows[-1][4],
-                "high": high_val,
-                "low": low_val,
-                "high_ts": rows[high_idx][0],
-                "low_ts": rows[low_idx][0],
-                "candles": rows,
-            })
-        bucket_start = bucket_end
-
-    return buckets
+def _build_depth_index(all_stats, level_idx):
+    """Build O(1) lookup: {exchange: {rounded_ts: (bid, ask)}} from stats rows.
+    Timestamps are rounded to nearest 60s for fuzzy matching."""
+    index = {}
+    for exch, rows in all_stats.items():
+        exch_idx = {}
+        for r in rows:
+            rounded = round(r[0] / 60) * 60  # round to nearest minute
+            bids = json.loads(r[2])
+            asks = json.loads(r[3])
+            if level_idx < len(bids):
+                exch_idx[rounded] = (bids[level_idx], asks[level_idx])
+        index[exch] = exch_idx
+    return index
 
 
-def render_aggregate_depth_chart(conn, hours=24):
+def _agg_depth_at_fast(depth_index, ts):
+    """O(1) aggregate depth lookup at a timestamp. Returns (bid, ask) — raw sums, no scaling."""
+    rounded = round(ts / 60) * 60
+    total_bid, total_ask = 0.0, 0.0
+    for exch, exch_idx in depth_index.items():
+        # Try exact, then ±1, ±2 min (collector polls every 60s but can drift)
+        for offset in [0, 60, -60, 120, -120]:
+            entry = exch_idx.get(rounded + offset)
+            if entry:
+                total_bid += entry[0]
+                total_ask += entry[1]
+                break
+    return total_bid, total_ask
+
+
+def render_aggregate_depth_chart(conn, hours=24, x_domain=None):
     """Separate bid/ask depth chart (aggregate across exchanges, 15m smoothed) — sits below CVD."""
     cutoff = int(time.time()) - hours * 3600
 
@@ -348,41 +358,24 @@ def render_aggregate_depth_chart(conn, hours=24):
 
     level_idx = 5  # 5.0%
 
+    # Build O(1) index
+    depth_index = _build_depth_index(all_stats, level_idx)
+
+
     # Collect all unique timestamps
-    all_ts = set()
-    for rows in all_stats.values():
-        for r in rows:
-            all_ts.add(r[0])
-    all_ts = sorted(all_ts)
+    all_ts = sorted({r[0] for rows in all_stats.values() for r in rows})
 
     if len(all_ts) < 30:
         return
 
-    # Sum depth across exchanges per timestamp, normalize by exchange count
-    # to prevent crash when some exchanges stop having data
     bid_series, ask_series, ts_depth = [], [], []
-    # Track how many exchanges have data at the most recent timestamp to set baseline
-    max_exchanges = len(all_stats)
 
     for ts in all_ts:
-        total_bid, total_ask = 0.0, 0.0
-        exch_count = 0
-        for exch, rows in all_stats.items():
-            for r in rows:
-                if abs(r[0] - ts) <= 90:
-                    bids = json.loads(r[2])
-                    asks = json.loads(r[3])
-                    if level_idx < len(bids):
-                        total_bid += bids[level_idx]
-                        total_ask += asks[level_idx]
-                        exch_count += 1
-                    break
-        if exch_count > 0:
-            # Scale up to full exchange count so chart doesn't drop when some go offline
-            scale = max_exchanges / exch_count
+        bid, ask = _agg_depth_at_fast(depth_index, ts)
+        if bid > 0 or ask > 0:
             ts_depth.append(ts)
-            bid_series.append(total_bid * scale)
-            ask_series.append(total_ask * scale)
+            bid_series.append(bid)
+            ask_series.append(ask)
 
     # Smooth
     if len(bid_series) > SMOOTH_WINDOW:
@@ -406,7 +399,7 @@ def render_aggregate_depth_chart(conn, hours=24):
     bid_line = (
         alt.Chart(df).mark_line(strokeWidth=1.5, color="#4caf50")
         .encode(
-            x=alt.X("time:T", axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
+            x=alt.X("time:T", scale=make_x_scale(x_domain), axis=alt.Axis(format="%m/%d %H:%M", labelAngle=-45, tickCount=8, title=None)),
             y=alt.Y("Bid Depth:Q", scale=alt.Scale(zero=False), title="Depth ($)"),
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Bid Depth:Q", format=",.0f")],
         )
@@ -414,7 +407,7 @@ def render_aggregate_depth_chart(conn, hours=24):
     ask_line = (
         alt.Chart(df).mark_line(strokeWidth=1.5, color="#f44336")
         .encode(
-            x="time:T",
+            x=alt.X("time:T", scale=make_x_scale(x_domain)),
             y=alt.Y("Ask Depth:Q", scale=alt.Scale(zero=False)),
             tooltip=[alt.Tooltip("time:T", format="%m/%d %H:%M"), alt.Tooltip("Ask Depth:Q", format=",.0f")],
         )
@@ -426,12 +419,15 @@ def render_aggregate_depth_chart(conn, hours=24):
 
 
 def compute_significant_events(conn, candle_rows, hours=24):
-    """Compute significant events: bid/ask depth ±50% in 1h, or price ±5% in 1h. Returns list of events."""
+    """Compute significant events: bid/ask depth ±100% in 1h, or price ±5% in 1h.
+    Rate of change filter: discard depth events that reverse within 30 min (MM noise)."""
     cutoff = int(time.time()) - hours * 3600
 
-    DEPTH_THRESHOLD = 50
+    DEPTH_THRESHOLD = 100
     PRICE_THRESHOLD = 5
     WINDOW_SEC = 3600
+    REVERSAL_WINDOW = 30 * 60  # 30 min lookahead for rate-of-change filter
+    REVERSAL_TOLERANCE = 0.20   # if depth returns within 20% of original, it's MM noise
 
     all_stats = {}
     for exch in ALL_EXCHANGES:
@@ -444,35 +440,26 @@ def compute_significant_events(conn, candle_rows, hours=24):
     if not all_stats or len(candle_filtered) < 30:
         return []
 
-    level_idx = 5  # 5.0%
+    level_idx = 6  # 10.0%
     events = []
+
+    # Build O(1) depth index
+    depth_index = _build_depth_index(all_stats, level_idx)
+
 
     # Slide 1h window in 15-min steps
     check_ts = cutoff
     now = int(time.time())
 
-    def agg_depth_at(ts):
-        total_bid, total_ask = 0.0, 0.0
-        for exch, rows in all_stats.items():
-            for r in rows:
-                if abs(r[0] - ts) <= 120:
-                    bids = json.loads(r[2])
-                    asks = json.loads(r[3])
-                    if level_idx < len(bids):
-                        total_bid += bids[level_idx]
-                        total_ask += asks[level_idx]
-                    break
-        return total_bid, total_ask
-
     while check_ts < now - WINDOW_SEC:
         window_end = check_ts + WINDOW_SEC
 
-        bid_start, ask_start = agg_depth_at(check_ts)
-        bid_end, ask_end = agg_depth_at(window_end)
+        bid_start, ask_start = _agg_depth_at_fast(depth_index, check_ts)
+        bid_end, ask_end = _agg_depth_at_fast(depth_index, window_end)
 
         prices_in_window = [r[4] for r in candle_filtered if check_ts <= r[0] < window_end]
 
-        if bid_start > 0 and ask_start > 0 and prices_in_window:
+        if bid_start > 0 and ask_start > 0 and bid_end > 0 and ask_end > 0 and prices_in_window:
             bid_chg = (bid_end - bid_start) / bid_start * 100
             ask_chg = (ask_end - ask_start) / ask_start * 100
             price_start = prices_in_window[0]
@@ -481,14 +468,37 @@ def compute_significant_events(conn, candle_rows, hours=24):
 
             # What triggered this event?
             triggers = []
+            is_depth_event = False
             if abs(bid_chg) >= DEPTH_THRESHOLD:
                 triggers.append(f"bid depth {bid_chg:+.0f}% in 1h")
+                is_depth_event = True
             if abs(ask_chg) >= DEPTH_THRESHOLD:
                 triggers.append(f"ask depth {ask_chg:+.0f}% in 1h")
+                is_depth_event = True
             if abs(price_chg) >= PRICE_THRESHOLD:
                 triggers.append(f"price {price_chg:+.1f}% in 1h")
 
             if triggers:
+                # Rate of change filter: check if depth change reversed within 30 min
+                if is_depth_event and abs(price_chg) < PRICE_THRESHOLD:
+                    # Only apply reversal filter to pure depth events (no price trigger)
+                    bid_30, ask_30 = _agg_depth_at_fast(depth_index, window_end + REVERSAL_WINDOW)
+                    reversed_bid = False
+                    reversed_ask = False
+                    if bid_30 > 0 and bid_start > 0 and abs(bid_chg) >= DEPTH_THRESHOLD:
+                        # Did bid return close to where it started?
+                        bid_recovery = abs(bid_30 - bid_start) / bid_start
+                        reversed_bid = bid_recovery < REVERSAL_TOLERANCE
+                    if ask_30 > 0 and ask_start > 0 and abs(ask_chg) >= DEPTH_THRESHOLD:
+                        ask_recovery = abs(ask_30 - ask_start) / ask_start
+                        reversed_ask = ask_recovery < REVERSAL_TOLERANCE
+                    # If all depth triggers reversed, skip this event
+                    depth_triggers_count = (1 if abs(bid_chg) >= DEPTH_THRESHOLD else 0) + (1 if abs(ask_chg) >= DEPTH_THRESHOLD else 0)
+                    reversed_count = (1 if reversed_bid else 0) + (1 if reversed_ask else 0)
+                    if reversed_count >= depth_triggers_count and depth_triggers_count > 0:
+                        check_ts += 15 * 60
+                        continue  # MM noise — skip
+
                 # Context interpretation
                 context = ""
                 if price_chg < -1 and bid_chg < -20:
@@ -499,13 +509,13 @@ def compute_significant_events(conn, candle_rows, hours=24):
                     context = "asks lifted — breakout buying"
                 elif price_chg > 1 and ask_chg > 20:
                     context = "new asks placed — selling into strength"
-                elif abs(price_chg) < 1 and bid_chg < -30:
+                elif abs(price_chg) < 1 and bid_chg < -50:
                     context = "bids pulled without price move — spoofing?"
-                elif abs(price_chg) < 1 and ask_chg < -30:
+                elif abs(price_chg) < 1 and ask_chg < -50:
                     context = "asks pulled without price move — spoofing?"
-                elif abs(price_chg) < 1 and bid_chg > 30:
+                elif abs(price_chg) < 1 and bid_chg > 50:
                     context = "large bid wall added"
-                elif abs(price_chg) < 1 and ask_chg > 30:
+                elif abs(price_chg) < 1 and ask_chg > 50:
                     context = "large ask wall added"
 
                 events.append({
@@ -521,17 +531,31 @@ def compute_significant_events(conn, candle_rows, hours=24):
 
         check_ts += 15 * 60  # step 15 min
 
-    return events
+    # Deduplicate: merge events within 30 min of each other (keep strongest)
+    if not events:
+        return []
+    deduped = [events[0]]
+    for e in events[1:]:
+        prev = deduped[-1]
+        if e["ts"] - prev["ts"] < 30 * 60:
+            # Keep the one with larger total change
+            prev_score = abs(prev["bid_chg"]) + abs(prev["ask_chg"]) + abs(prev["price_chg"]) * 10
+            e_score = abs(e["bid_chg"]) + abs(e["ask_chg"]) + abs(e["price_chg"]) * 10
+            if e_score > prev_score:
+                deduped[-1] = e
+        else:
+            deduped.append(e)
+    return deduped
 
 
 def render_significant_events(events):
     """Render the significant events table."""
     if not events:
-        st.caption("No significant events (triggers: depth ±50% or price ±5% in 1h)")
+        st.caption("No significant events (triggers: depth ±100% or price ±5% in 1h, with 30-min reversal filter)")
         return
 
     st.markdown(f"**Significant events ({len(events)} detected):**")
-    st.caption("Triggers: bid/ask depth ±50% in 1h OR price ±5% in 1h")
+    st.caption("Triggers: bid/ask depth ±100% at 10% level in 1h OR price ±5% in 1h · Rate of change filter: ignores depth changes that reverse within 30 min")
 
     rows_html = ""
     for e in reversed(events):
@@ -561,102 +585,6 @@ def render_significant_events(events):
     </table>"""
     st.markdown(html, unsafe_allow_html=True)
 
-
-# ── Trades Section ──────────────────────────────────────────────────────────
-
-def render_notable_events(conn, hours=24):
-    """Show large trades + significant depth events (all >2σ)."""
-    cutoff = int(time.time()) - hours * 3600
-
-    # Gather large trades from all exchanges
-    all_events = []
-    for exch in ALL_EXCHANGES:
-        trades = get_trades_history(conn, exch, SYMBOL, from_ts=cutoff, large_only=True)
-        for t in trades:
-            ts, price, size_usd, side, is_large, z_score = t
-            all_events.append({
-                "ts": ts, "type": "trade", "exch": exch,
-                "side": side, "price": price, "size_usd": size_usd, "z_score": z_score,
-                "detail": f"{side.upper()} ${size_usd:,.0f}",
-            })
-
-    # Gather depth events (>2σ, from primary exchange)
-    depth_evts = get_depth_events(conn, EXCHANGE, SYMBOL, from_ts=cutoff, min_usd=0)
-    for row in depth_evts:
-        ts, price, side, event_type, size_before, size_after, size_usd, filled = row
-        all_events.append({
-            "ts": ts, "type": "depth", "exch": PRIMARY_EXCHANGE,
-            "side": side, "price": price, "size_usd": size_usd, "z_score": 0,
-            "detail": f"{event_type.upper()} {side} ${size_usd:,.0f}",
-        })
-
-    if not all_events:
-        st.info("No notable events yet. Start trades_collector.py to begin tracking.")
-        return
-
-    # Sort by timestamp, most recent first
-    all_events.sort(key=lambda x: x["ts"], reverse=True)
-
-    header = "<tr><th>Time</th><th>Source</th><th>Exchange</th><th>Side</th><th>Detail</th><th>Price</th><th>Size</th></tr>"
-    rows_html = ""
-    type_colors = {"trade": "#4fc3f7", "depth": "#ff9800"}
-    for e in all_events[:50]:
-        side_color = "#4caf50" if e["side"] == "buy" or e["side"] == "bid" else "#f44336"
-        tc = type_colors.get(e["type"], "#888")
-        label = "TRADE" if e["type"] == "trade" else "BOOK"
-        rows_html += (
-            f'<tr>'
-            f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(e["ts"]))}</td>'
-            f'<td style="color:{tc};font-weight:bold">{label}</td>'
-            f'<td>{e["exch"]}</td>'
-            f'<td style="color:{side_color};font-weight:bold">{e["side"].upper()}</td>'
-            f'<td style="text-align:left">{e["detail"]}</td>'
-            f'<td>{e["price"]:.4f}</td>'
-            f'<td>${e["size_usd"]:,.0f}</td>'
-            f'</tr>'
-        )
-
-    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.0">
-    <thead style="border-bottom:1px solid #333">{header}</thead>
-    <tbody>{rows_html}</tbody>
-    </table>"""
-    st.markdown(html, unsafe_allow_html=True)
-
-    # Summary stats
-    trade_events = [e for e in all_events if e["type"] == "trade"]
-    depth_events_list = [e for e in all_events if e["type"] == "depth"]
-    buy_large = [e for e in trade_events if e["side"] == "buy"]
-    sell_large = [e for e in trade_events if e["side"] == "sell"]
-    buy_vol = sum(e["size_usd"] for e in buy_large)
-    sell_vol = sum(e["size_usd"] for e in sell_large)
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Large Buys", f"{len(buy_large)} (${buy_vol:,.0f})")
-    col2.metric("Large Sells", f"{len(sell_large)} (${sell_vol:,.0f})")
-    net = buy_vol - sell_vol
-    col3.metric("Net Large", f"${net:+,.0f}")
-    col4.metric("Book Events", f"{len(depth_events_list)}")
-
-
-def render_trade_intensity(conn, hours=24):
-    """Trades per minute chart."""
-    now = int(time.time())
-    cutoff = now - hours * 3600
-    buckets = get_trade_stats(conn, EXCHANGE, SYMBOL, cutoff, now)
-
-    if not buckets:
-        return
-
-    timestamps = [b[0] for b in buckets]
-    counts = [b[1] for b in buckets]
-    buy_vols = [b[2] for b in buckets]
-    sell_vols = [b[3] for b in buckets]
-
-    timestamps, counts = downsample(timestamps, counts, max_points=300)
-
-    st.markdown("**Trade Intensity (trades/min)**")
-    df = pd.DataFrame({"Trades/min": counts}, index=[ts_to_label(t) for t in timestamps])
-    st.line_chart(df, height=150, use_container_width=True)
 
 
 # ── Depth Section ───────────────────────────────────────────────────────────
@@ -745,78 +673,159 @@ def render_depth_change_table(stats_rows, label=None):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def render_depth_chart(stats_rows, level_idx, side, hours=24):
+def render_depth_chart(conn, level_idx, side, hours=24):
+    """Aggregate depth chart across all exchanges for a given level and side."""
     cutoff = int(time.time()) - hours * 3600
-    filtered = [r for r in stats_rows if r[0] >= cutoff]
-    if len(filtered) < SMOOTH_WINDOW:
+
+    all_stats = {}
+    for exch in ALL_EXCHANGES:
+        rows = get_stats_history(conn, exch, SYMBOL, from_ts=cutoff)
+        if rows:
+            all_stats[exch] = rows
+
+    if not all_stats:
+        st.info("Not enough data for depth chart")
+        return
+
+    depth_index = _build_depth_index(all_stats, level_idx)
+
+    all_ts = sorted({r[0] for rows in all_stats.values() for r in rows})
+
+    if len(all_ts) < SMOOTH_WINDOW:
         st.info("Not enough data for smoothed depth chart")
         return
 
-    field_idx = 2 if side == "bid" else 3
-    raw = [json.loads(row[field_idx])[level_idx] for row in filtered]
+    field = 0 if side == "bid" else 1  # index into (bid, ask) tuple
+    raw = []
+    ts_valid = []
+    for ts in all_ts:
+        bid, ask = _agg_depth_at_fast(depth_index, ts)
+        val = bid if side == "bid" else ask
+        if val > 0:
+            raw.append(val)
+            ts_valid.append(ts)
+
+    if len(raw) < SMOOTH_WINDOW:
+        return
+
     smoothed = smooth(raw, SMOOTH_WINDOW)
-    timestamps = [r[0] for r in filtered[SMOOTH_WINDOW - 1:]]
+    timestamps = ts_valid[SMOOTH_WINDOW - 1:]
     timestamps, smoothed = downsample(timestamps, smoothed)
 
     side_label = "Bid" if side == "bid" else "Ask"
     level_label = f"{side_label} depth {DEPTH_LEVELS[level_idx]} pct"
     color = "#4caf50" if side == "bid" else "#f44336"
-    st.markdown(f"**{side_label} @ {DEPTH_LEVELS[level_idx]}% (15m avg)**")
+    st.markdown(f"**{side_label} @ {DEPTH_LEVELS[level_idx]}% (15m avg, all exchanges)**")
     df = pd.DataFrame({"time": [ts_to_datetime(t) for t in timestamps], level_label: smoothed})
     st.altair_chart(make_chart(df, level_label, color=color, height=250), use_container_width=True)
 
 
-# ── Depth Events (WS fill/pull tracking) ───────────────────────────────────
 
-def render_depth_events(conn, hours=24):
-    """Show recent order book events: fills, pulls, new orders from WS depth tracking."""
-    cutoff = int(time.time()) - hours * 3600
-    events = get_depth_events(conn, EXCHANGE, SYMBOL, from_ts=cutoff, min_usd=500)
+# ── Process Control ──────────────────────────────────────────────────────────
 
-    if not events:
-        st.caption("No depth events yet. Start trades_collector.py for live tracking. WebSocket only — does not backfill.")
-        return
-
-    st.markdown("**Order Book Events (live)**")
-    st.caption("Real-time fill/pull detection from WebSocket depth stream")
-
-    # events: (timestamp, price, side, event_type, size_before, size_after, size_usd, filled)
-    header = "<tr><th>Time</th><th>Side</th><th>Type</th><th>Price</th><th>Size $</th><th>Before→After</th></tr>"
-    rows_html = ""
-    for row in events[:50]:
-        ts, price, side, event_type, size_before, size_after, size_usd, filled = row
-        type_colors = {
-            "filled": "#4caf50", "pulled": "#f44336", "added": "#4fc3f7",
-            "partially_filled": "#ff9800", "reduced": "#ff9800",
-        }
-        tc = type_colors.get(event_type, "#888")
-        sc = "#4caf50" if side == "bid" else "#f44336"
-        rows_html += (
-            f'<tr>'
-            f'<td>{time.strftime("%m/%d %H:%M:%S", time.gmtime(ts))}</td>'
-            f'<td style="color:{sc}">{side.upper()}</td>'
-            f'<td style="color:{tc};font-weight:bold">{event_type.upper()}</td>'
-            f'<td>{price:.4f}</td>'
-            f'<td>${size_usd:,.0f}</td>'
-            f'<td>${size_before:,.0f}→${size_after:,.0f}</td>'
-            f'</tr>'
+def _find_process(script_name):
+    """Find a running python process by script name. Returns (pid, uptime) or None."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,etime,command"],
+            capture_output=True, text=True, timeout=5
         )
+        for line in result.stdout.strip().split("\n"):
+            if script_name in line and "python" in line.lower() and "grep" not in line and "ps -eo" not in line:
+                parts = line.split()
+                pid = int(parts[0])
+                uptime = parts[1]
+                return pid, uptime
+    except Exception:
+        pass
+    return None
 
-    html = f"""<table style="width:100%;border-collapse:collapse;text-align:right;font-family:monospace;font-size:13px;line-height:2.0">
-    <thead style="border-bottom:1px solid #333">{header}</thead>
-    <tbody>{rows_html}</tbody>
-    </table>"""
-    st.markdown(html, unsafe_allow_html=True)
 
-    # Summary: fills vs pulls
-    fills = [e for e in events if e[3] in ("filled", "partially_filled")]
-    pulls = [e for e in events if e[3] == "pulled"]
-    added = [e for e in events if e[3] == "added"]
+def _start_process(script_name):
+    """Start a collector script in the background."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file = os.path.join(script_dir, f"{script_name.replace('.py', '')}.log")
+    with open(log_file, "a") as log:
+        proc = subprocess.Popen(
+            ["python3", os.path.join(script_dir, script_name)],
+            stdout=log, stderr=log,
+            cwd=script_dir,
+            start_new_session=True  # survives parent exit
+        )
+    return proc.pid
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Filled", f"{len(fills)} (${sum(e[6] for e in fills):,.0f})")
-    col2.metric("Pulled", f"{len(pulls)} (${sum(e[6] for e in pulls):,.0f})")
-    col3.metric("Added", f"{len(added)} (${sum(e[6] for e in added):,.0f})")
+
+def _stop_process(script_name):
+    """Stop all processes matching script name."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,command"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split("\n"):
+            if script_name in line and "python" in line.lower() and "grep" not in line:
+                pid = int(line.split()[0])
+                os.kill(pid, signal.SIGTERM)
+        return True
+    except Exception:
+        return False
+
+
+def _render_control_panel():
+    """Status table showing collector health + data freshness."""
+    conn = get_conn()
+    collector_proc = _find_process("collector.py")
+    trades_proc = _find_process("trades_collector.py")
+    now = time.time()
+
+    rows = []
+    # Collector row
+    if collector_proc:
+        # Get latest data timestamp
+        latest = conn.execute("SELECT MAX(timestamp) FROM candles WHERE symbol=?", (SYMBOL,)).fetchone()[0]
+        data_age = f"{int((now - latest) / 60)}m ago" if latest else "no data"
+        rows.append({"Process": "collector.py", "Status": "Running", "Uptime": collector_proc[1],
+                      "Data": f"REST (VD, stats, candles)", "Last data": data_age, "Backfills": "Yes"})
+    else:
+        rows.append({"Process": "collector.py", "Status": "Stopped", "Uptime": "—",
+                      "Data": "REST (VD, stats, candles)", "Last data": "—", "Backfills": "Yes"})
+
+    # Trades collector row
+    if trades_proc:
+        latest = conn.execute("SELECT MAX(timestamp) FROM trades WHERE symbol=?", (SYMBOL,)).fetchone()[0]
+        data_age = f"{int((now - latest) / 60)}m ago" if latest else "no data"
+        rows.append({"Process": "trades_collector.py", "Status": "Running", "Uptime": trades_proc[1],
+                      "Data": "WS (trades, depth events)", "Last data": data_age, "Backfills": "No"})
+    else:
+        rows.append({"Process": "trades_collector.py", "Status": "Stopped", "Uptime": "—",
+                      "Data": "WS (trades, depth events)", "Last data": "—", "Backfills": "No"})
+
+    df = pd.DataFrame(rows)
+
+    # Color the status
+    def color_status(val):
+        if val == "Running":
+            return "color: #4caf50"
+        return "color: #f44336"
+
+    st.dataframe(
+        df.style.map(color_status, subset=["Status"]),
+        use_container_width=True, hide_index=True, height=110
+    )
+
+    # Start buttons if something is stopped
+    if not collector_proc or not trades_proc:
+        cols = st.columns(4)
+        if not collector_proc:
+            if cols[0].button("Start collector"):
+                _start_process("collector.py")
+                time.sleep(1)
+                st.rerun()
+        if not trades_proc:
+            if cols[1].button("Start trades"):
+                _start_process("trades_collector.py")
+                time.sleep(1)
+                st.rerun()
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -842,6 +851,9 @@ def main():
     if not vd_rows or not stats_rows:
         st.error("No data yet. Run backfill.py first, then start collector.py.")
         return
+
+    # ── Control Panel ──
+    _render_control_panel()
 
     # Header
     last_stats = stats_rows[-1]
@@ -877,17 +889,8 @@ def main():
 
     st.divider()
 
-    # ── 2. NOTABLE TRADES + DEPTH EVENTS ──
-    st.markdown("## 2. Notable Events (z-score > 2σ)")
-    st.caption("Large trades + significant order book changes. All >2σ vs last 1h. WebSocket only — does not backfill.")
-
-    render_notable_events(conn, hours=hours)
-    render_trade_intensity(conn, hours=hours)
-
-    st.divider()
-
-    # ── 3. LIMIT ORDER ACTIVITY ──
-    st.markdown("## 3. Limit Order Activity (Depth Changes)")
+    # ── 2. LIMIT ORDER ACTIVITY ──
+    st.markdown("## 2. Limit Order Activity (Depth Changes)")
     st.caption("15-min smoothed averages. Green = depth increased >5%, Red = decreased >5%.")
 
     # Show last reading per exchange
@@ -963,14 +966,17 @@ def main():
     if level_choice is not None:
         col1, col2 = st.columns(2)
         with col1:
-            render_depth_chart(stats_rows, level_choice, "bid", hours=hours)
+            render_depth_chart(conn, level_choice, "bid", hours=hours)
         with col2:
-            render_depth_chart(stats_rows, level_choice, "ask", hours=hours)
+            render_depth_chart(conn, level_choice, "ask", hours=hours)
 
-    # Auto-refresh
+    # Auto-refresh with countdown
     st.divider()
-    st.caption(f"Last update: {ts_to_label(stats_rows[-1][0])} UTC | Auto-refresh: 60s")
-    time.sleep(60)
+    st.caption(f"Last update: {ts_to_label(stats_rows[-1][0])} UTC")
+    countdown = st.empty()
+    for remaining in range(60, 0, -1):
+        countdown.caption(f"↻ Refreshing in {remaining}s")
+        time.sleep(1)
     st.rerun()
 
 
